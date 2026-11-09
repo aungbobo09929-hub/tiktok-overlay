@@ -11,6 +11,7 @@
     <div id="banners"></div>
   </div>
 
+  <script src="/socket.io/socket.io.js"></script>
   <script>
   (() => {
     'use strict';
@@ -1110,34 +1111,50 @@
     requestAnimationFrame(tick);
 
     /* ============================================================ */
-    /*  WebSocket (auto-reconnect)                                   */
+    /*  Socket.IO (auto-reconnect)                                   */
+    /*  OBS URL:  https://your-app.onrender.com/?username=TIKTOK_NAME */
+    /*  The server connects to that streamer's TikTok LIVE and sends */
+    /*  the events: sync, gift, bot, reset (same data as before).    */
     /* ============================================================ */
-    function connect() {
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(`${proto}://${location.host}`);
-      ws.onmessage = (ev) => {
-        try {
-          const msg = JSON.parse(ev.data);
-          if (msg.type === 'sync') {                          // saved hall from the server
-            if (msg.config && !params.has('botMin') && !params.has('botMax')) {
-              const c = msg.config;
-              if (typeof c.botEnabled === 'boolean' && params.get('bots') !== '0') CFG.botEnabled = c.botEnabled;
-              if (c.botMinMs > 0) CFG.botMinMs = c.botMinMs;
-              if (c.botMaxMs >= CFG.botMinMs) CFG.botMaxMs = c.botMaxMs;
-            }
-            if (msg.config && typeof msg.config.dhammaVolume === 'number' && msg.config.dhammaVolume >= 0) {
-              CFG.dhammaVolume = msg.config.dhammaVolume;
-              Dhamma.applyVolume();
-            }
-            populate(msg.users);
+    function handleServerMessage(msg) {
+      try {
+        if (msg.type === 'sync') {                            // saved hall from the server
+          if (msg.config && !params.has('botMin') && !params.has('botMax')) {
+            const c = msg.config;
+            if (typeof c.botEnabled === 'boolean' && params.get('bots') !== '0') CFG.botEnabled = c.botEnabled;
+            if (c.botMinMs > 0) CFG.botMinMs = c.botMinMs;
+            if (c.botMaxMs >= CFG.botMinMs) CFG.botMaxMs = c.botMaxMs;
           }
-          else if (msg.type === 'bot') spawnBot();            // /bot test link
-          else if (msg.type === 'gift') onGift(msg);          // ONLY gifts spawn real users
-          else if (msg.type === 'reset') location.reload();
-        } catch (e) { /* ignore bad messages */ }
-      };
-      ws.onclose = () => setTimeout(connect, 2000);
-      ws.onerror = () => ws.close();
+          if (msg.config && typeof msg.config.dhammaVolume === 'number' && msg.config.dhammaVolume >= 0) {
+            CFG.dhammaVolume = msg.config.dhammaVolume;
+            Dhamma.applyVolume();
+          }
+          populate(msg.users);
+        }
+        else if (msg.type === 'bot') spawnBot();              // /bot test link
+        else if (msg.type === 'gift') onGift(msg);            // ONLY gifts spawn real users
+        else if (msg.type === 'reset') location.reload();
+      } catch (e) { /* ignore bad messages */ }
+    }
+
+    function connect() {
+      if (typeof io !== 'function') {                         // socket.io client script not loaded: retry the page load
+        console.error('[socket] socket.io client missing - retrying in 5s');
+        setTimeout(() => location.reload(), 5000);
+        return;
+      }
+      const username = (params.get('username') || '').trim();
+      const socket = io({
+        query: { username },
+        transports: ['websocket', 'polling'],
+        reconnection: true,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000,
+      });
+      ['sync', 'bot', 'gift', 'reset'].forEach((t) =>
+        socket.on(t, (m) => handleServerMessage(Object.assign({}, m || {}, { type: t }))));
+      socket.on('status', (s) => console.log('[status]', s && s.state));
+      socket.on('connect_error', (e) => console.warn('[socket] connect_error:', e && e.message));
     }
     connect();
 
