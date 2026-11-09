@@ -1,163 +1,126 @@
 'use strict';
 
 /* ------------------------------------------------------------------ */
-/*  Sayadaw Dhamma Preaching Live  -  overlay server (PORT 5000)       */
+/*  Sayadaw Dhamma Preaching Live - cloud overlay server               */
+/*  Standalone: connects straight to TikTok LIVE (no TikFinity).       */
+/*  Multi-tenant: OBS URL = https://your-app.onrender.com/?username=XXX */
 /* ------------------------------------------------------------------ */
 
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const express = require('express');
-const { WebSocketServer, WebSocket } = require('ws');
+const { Server } = require('socket.io');
+const { WebcastPushConnection } = require('tiktok-live-connector');
 
-/* TikFinity local WebSocket (TikFinity Desktop App must be running and connected to your LIVE). */
-const TIKFINITY_WS_URL = process.env.TIKFINITY_WS || 'ws://localhost:21213/';
+const PORT = process.env.PORT || 3000;
+const MAX_ROOMS = Number(process.env.MAX_ROOMS) || 50;      // max different streamers at once
+const GRACE_MS = 30000;      // keep the TikTok connection this long after the last OBS client leaves
+                             // (an OBS refresh does not cause a reconnect to TikTok)
+const RETRY_BASE_MS = 15000; // reconnect backoff: 15s, 30s, 60s, 120s (max) - protects against IP bans
+const RETRY_MAX_MS = 120000;
 
-const PORT = 5000;                 // Sayadaw Dhamma Preaching Live
-const RECONNECT_DELAY_MS = 5000;
-
-/* ------------------------------------------------------------------ */
-/*  Idle loop: bot devotees keep the screen moving while nobody sends  */
-/*  a gift. Sent to the overlay on connect, so you only edit it here.  */
-/* ------------------------------------------------------------------ */
+/* Idle bots + sound: sent to the overlay on connect (same as before) */
 const BOT_ENABLED = true;
-const BOT_MIN_MS = 10000;   // 10 seconds
-const BOT_MAX_MS = 15000;   // 15 seconds
+const BOT_MIN_MS = 10000;
+const BOT_MAX_MS = 15000;
+const SOUND_CONFIG = { dhammaVolume: 0.5 };
 
 /* ------------------------------------------------------------------ */
-/*  Sound settings (sent to the overlay on connect)                    */
-/*  Optional background chanting loop: put  dhamma.mp3  in this folder.*/
-/*  No dhamma.mp3?  The overlay stays silent (bowing is always silent).*/
+/*  Hall memory (per streamer):  hall.json = { "username": [users] }   */
+/*  NOTE: Render's disk is ephemeral - hall.json is reset on redeploy  */
+/*  unless you attach a Render Disk and set HALL_DIR to its mount path.*/
 /* ------------------------------------------------------------------ */
-const SOUND_CONFIG = {
-  dhammaVolume: 0.5,     // background loop (dhamma.mp3), 0.0 - 1.0
-};
+const HALL_FILE = path.join(process.env.HALL_DIR || __dirname, 'hall.json');
+const HALL_MAX = 30;
 
-/* ------------------------------------------------------------------ */
-/*  Hall memory                                                        */
-/*  The server remembers the most recent gift senders (hall.json) so   */
-/*  the seated devotees come back after you refresh OBS or restart.    */
-/* ------------------------------------------------------------------ */
-const HALL_FILE = path.join(__dirname, 'hall.json');
-const HALL_MAX = 30;   // must be >= number of seats in index.html (20 seats: 10 left + 10 right)
-
-let hall = [];
+let halls = {};
 try {
   const saved = JSON.parse(fs.readFileSync(HALL_FILE, 'utf8'));
-  if (Array.isArray(saved)) hall = saved.slice(-HALL_MAX);
-} catch (e) { /* first run: no file yet */ }
+  if (saved && typeof saved === 'object' && !Array.isArray(saved)) halls = saved;
+} catch (e) { /* first run */ }
 
-// Debounced: a burst of gifts writes hall.json once, never several overlapping writes
 let saveTimer = null;
 function saveHall() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
     try {
-      fs.writeFile(HALL_FILE, JSON.stringify(hall, null, 1), (err) => {
-        if (err) console.error('[HALL] could not save hall.json:', err.message);
+      fs.writeFile(HALL_FILE, JSON.stringify(halls, null, 1), (err) => {
+        if (err) console.error('[HALL] could not save:', err.message);
       });
-    } catch (e) {
-      console.error('[HALL] save failed:', e.message);
-    }
+    } catch (e) { console.error('[HALL] save failed:', e.message); }
   }, 500);
 }
 
-// decodeURIComponent that never throws on emojis / malformed % sequences
-function safeDecode(s) {
-  try { return decodeURIComponent(s); } catch (e) { return String(s); }
-}
-// Any query value (string, array, object, emoji, garbage) -> short safe string
-function safeStr(v, max, fallback) {
-  try {
-    if (Array.isArray(v)) v = v[0];
-    if (v === undefined || v === null || typeof v === 'object') return fallback;
-    const s = String(v).trim();
-    return s ? Array.from(s).slice(0, max).join('') : fallback;   // Array.from = never cuts an emoji in half
-  } catch (e) { return fallback; }
-}
-
-function rememberUser(u) {
-  hall = hall.filter((h) => h.userId !== u.userId);   // same viewer moves to "newest"
-  hall.push({
-    userId: u.userId,
-    nickname: u.nickname,
-    profilePictureUrl: u.profilePictureUrl,
-  });
-  if (hall.length > HALL_MAX) hall = hall.slice(-HALL_MAX);
+function rememberUser(username, u) {
+  let list = (halls[username] || []).filter((h) => h.userId !== u.userId);
+  list.push({ userId: u.userId, nickname: u.nickname, profilePictureUrl: u.profilePictureUrl });
+  if (list.length > HALL_MAX) list = list.slice(-HALL_MAX);
+  halls[username] = list;
   saveHall();
 }
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
+function safeStr(v, max, fallback) {
+  try {
+    if (Array.isArray(v)) v = v[0];
+    if (v === undefined || v === null || typeof v === 'object') return fallback;
+    const s = String(v).trim();
+    return s ? Array.from(s).slice(0, max).join('') : fallback;
+  } catch (e) { return fallback; }
+}
+function safeDecode(s) { try { return decodeURIComponent(s); } catch (e) { return String(s); } }
 
-// Works with flat fields (TikFinity / v1) and nested "user" (v2) shapes
+// "@Some.User " -> "some.user"; returns null when it is not a valid TikTok username
+function normalizeUsername(v) {
+  const s = safeStr(v, 40, '').replace(/^@+/, '').toLowerCase();
+  return /^[a-z0-9._]{2,24}$/.test(s) ? s : null;
+}
+
+// tiktok-live-connector v1 delivers flat fields; nested "user" is handled too
 function getUser(d) {
   const u = d.user || {};
   const nickname = d.nickname || u.nickname || d.uniqueId || u.uniqueId || 'Guest';
   const userId = String(d.userId || u.userId || d.uniqueId || u.uniqueId || nickname);
-  const profilePictureUrl =
-    d.profilePictureUrl ||
+  const profilePictureUrl = d.profilePictureUrl ||
     (typeof u.profilePicture === 'string' ? u.profilePicture : '') ||
     (u.profilePicture && ((u.profilePicture.url && u.profilePicture.url[0]) ||
-      (u.profilePicture.urls && u.profilePicture.urls[0]))) ||
-    '';
+      (u.profilePicture.urls && u.profilePicture.urls[0]))) || '';
   return { userId, nickname, profilePictureUrl };
 }
-
 function getGift(d) {
   const det = d.giftDetails || {};
   const giftName = d.giftName || det.giftName || (d.gift && d.gift.name) || 'Gift';
   const giftType = d.giftType !== undefined ? d.giftType : det.giftType;
   const count = Math.max(1, Number(d.repeatCount) || 1);
-  const giftPictureUrl =
-    d.giftPictureUrl ||
-    (det.giftImage && (det.giftImage.giftPictureUrl || (det.giftImage.url && det.giftImage.url[0]))) ||
-    '';
+  const giftPictureUrl = d.giftPictureUrl ||
+    (det.giftImage && (det.giftImage.giftPictureUrl || (det.giftImage.url && det.giftImage.url[0]))) || '';
   return { giftName, giftType, count, giftPictureUrl };
 }
 
 /* ------------------------------------------------------------------ */
-/*  Web server + WebSocket (for the overlay in OBS)                    */
+/*  Web server + Socket.IO                                             */
 /* ------------------------------------------------------------------ */
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const io = new Server(server, { maxHttpBufferSize: 1e4, pingInterval: 20000, pingTimeout: 25000 });
 
-// Static files: every asset in this folder is served (html, css, png, mp4, mp3, ...),
-// so new images / audio never 404. Code and data files stay private.
-const SERVED_EXT = new Set([
-  '.html', '.css', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg',
-  '.mp4', '.webm', '.mp3', '.ogg', '.wav', '.m4a', '.woff', '.woff2', '.ttf',
-]);
-const PRIVATE_FILES = new Set(['server.js', 'hall.json', 'package.json', 'package-lock.json']);
-const staticFiles = express.static(__dirname, {
-  index: false,
-  dotfiles: 'ignore',
-  fallthrough: true,   // static also handles HTTP Range requests (needed for video)
-});
+const rooms = new Map();   // username -> room
 
-function broadcast(payload) {
-  let msg;
-  try { msg = JSON.stringify(payload); } catch (e) { return; }
-  for (const client of wss.clients) {
-    try {
-      if (client.readyState === WebSocket.OPEN) client.send(msg);
-    } catch (e) {
-      console.error('[WS] send failed:', e.message);
-    }
-  }
+function emitTo(room, event, payload) {
+  try { io.to(room.id).emit(event, Object.assign({ type: event }, payload || {})); }
+  catch (e) { console.error('[IO] emit failed:', e.message); }
 }
 
 let eventCounter = 0;
-
-// ANY gift sends a devotee: walk up -> bow 3x -> walk to a seat -> listen to the sermon
-function sendGift(user, gift, persist) {
+// ANY gift sends a devotee. Payload is identical to the old WebSocket message.
+function sendGift(room, user, gift, persist) {
   eventCounter += 1;
-  if (persist) rememberUser(user);
-  broadcast({
-    type: 'gift',
+  if (persist) rememberUser(room.name, user);
+  emitTo(room, 'gift', {
     id: `gift-${Date.now()}-${eventCounter}`,
     userId: user.userId,
     nickname: user.nickname,
@@ -168,15 +131,160 @@ function sendGift(user, gift, persist) {
   });
 }
 
-// Test without TikTok (test gifts are NOT saved to hall.json):
-//   http://localhost:5000/test?name=Hung&gift=Rose&count=3
-//   http://localhost:5000/test?name=Guest&n=20     (20 different viewers, 0.8s apart)
-// The reply goes out FIRST (instant "OK"), the gift is processed afterwards, so TikFinity never times out.
-app.get('/test', (req, res) => {
-  res.status(200).send('OK');   // answer immediately, before any processing
+/* ------------------------------------------------------------------ */
+/*  TikTok connection per streamer (shared by all their OBS clients)   */
+/* ------------------------------------------------------------------ */
+function getRoom(username) {
+  let room = rooms.get(username);
+  if (room) return room;
+  if (rooms.size >= MAX_ROOMS) return null;
+  room = {
+    id: 'u:' + username, name: username,
+    clients: 0, conn: null,
+    graceTimer: null, retryTimer: null, retries: 0,
+    lastGiftKey: '', lastGiftAt: 0, closed: false,
+  };
+  rooms.set(username, room);
+  return room;
+}
 
+function handleTikTokGift(room, data) {
+  const gift = getGift(data);
+  // Streakable gifts fire many events while tapping: only the final one counts
+  if (gift.giftType === 1 && data.repeatEnd === false) return;
+
+  const user = getUser(data);
+  const key = `${user.userId}|${gift.giftName}|${gift.count}|${data.msgId || data.giftId || ''}`;
+  const now = Date.now();
+  if (data.msgId && key === room.lastGiftKey && now - room.lastGiftAt < 1000) return;
+  room.lastGiftKey = key;
+  room.lastGiftAt = now;
+
+  console.log(`[${room.name}] GIFT ${user.nickname} sent ${gift.giftName} x${gift.count}`);
+  sendGift(room, user, gift, true);
+}
+
+function scheduleRetry(room) {
+  if (room.closed || room.retryTimer || room.clients <= 0) return;
+  const delay = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * Math.pow(2, room.retries));
+  room.retries += 1;
+  console.log(`[${room.name}] retrying TikTok in ${delay / 1000}s`);
+  room.retryTimer = setTimeout(() => { room.retryTimer = null; startTikTok(room); }, delay);
+}
+
+function startTikTok(room) {
+  if (room.closed || room.conn || room.clients <= 0) return;
+  const conn = new WebcastPushConnection(room.name, {
+    processInitialData: false,        // do not replay old chat/gifts
+    enableExtendedGiftInfo: true,     // gives giftPictureUrl for the banner
+    requestPollingIntervalMs: 2000,
+  });
+  room.conn = conn;
+
+  // The 5 event types requested. Only "gift" drives the current frontend;
+  // the others are forwarded under their own names and simply ignored by it.
+  conn.on('gift', (d) => { try { handleTikTokGift(room, d); } catch (e) { console.error('[gift]', e.message); } });
+  conn.on('chat', (d) => emitTo(room, 'chat', { ...getUser(d), comment: safeStr(d.comment, 200, '') }));
+  conn.on('follow', (d) => emitTo(room, 'follow', getUser(d)));
+  conn.on('share', (d) => emitTo(room, 'share', getUser(d)));
+  conn.on('member', (d) => emitTo(room, 'join', getUser(d)));
+
+  conn.on('streamEnd', () => {
+    console.log(`[${room.name}] live ended`);
+    emitTo(room, 'status', { state: 'ended' });
+  });
+  conn.on('disconnected', () => {
+    if (room.conn !== conn) return;
+    room.conn = null;
+    console.log(`[${room.name}] TikTok disconnected`);
+    emitTo(room, 'status', { state: 'disconnected' });
+    scheduleRetry(room);
+  });
+  conn.on('error', (e) => console.error(`[${room.name}] TikTok error:`, (e && (e.message || e.info)) || e));
+
+  conn.connect().then((state) => {
+    if (room.conn !== conn) { try { conn.disconnect(); } catch (e) { /* ignore */ } return; }
+    room.retries = 0;
+    console.log(`[${room.name}] connected to LIVE room ${state && state.roomId}`);
+    emitTo(room, 'status', { state: 'connected' });
+  }).catch((err) => {
+    if (room.conn === conn) room.conn = null;
+    console.error(`[${room.name}] connect failed:`, (err && err.message) || err);
+    emitTo(room, 'status', { state: 'offline' });   // not live yet / blocked: keep trying with backoff
+    scheduleRetry(room);
+  });
+}
+
+function stopTikTok(room) {
+  if (room.retryTimer) { clearTimeout(room.retryTimer); room.retryTimer = null; }
+  const conn = room.conn;
+  room.conn = null;
+  if (conn) {
+    try { conn.removeAllListeners(); conn.on('error', () => {}); conn.disconnect(); }
+    catch (e) { console.error(`[${room.name}] disconnect failed:`, e.message); }
+  }
+}
+
+function closeRoom(room) {
+  room.closed = true;
+  if (room.graceTimer) { clearTimeout(room.graceTimer); room.graceTimer = null; }
+  stopTikTok(room);
+  rooms.delete(room.name);
+  console.log(`[${room.name}] room closed (no OBS clients) - TikTok connection released`);
+}
+
+io.on('connection', (socket) => {
+  const username = normalizeUsername(socket.handshake.query && socket.handshake.query.username);
+  if (!username) {
+    // No / invalid ?username= : stay connected but empty, tell the overlay why
+    socket.emit('status', { type: 'status', state: 'no-username' });
+    socket.emit('sync', { type: 'sync', users: [], config: Object.assign({ botEnabled: BOT_ENABLED, botMinMs: BOT_MIN_MS, botMaxMs: BOT_MAX_MS }, SOUND_CONFIG) });
+    return;
+  }
+  const room = getRoom(username);
+  if (!room) {
+    socket.emit('status', { type: 'status', state: 'server-full' });
+    socket.disconnect(true);
+    return;
+  }
+
+  socket.join(room.id);
+  room.clients += 1;
+  if (room.graceTimer) { clearTimeout(room.graceTimer); room.graceTimer = null; }
+  console.log(`[${username}] overlay connected (${room.clients} client(s))`);
+
+  socket.emit('sync', {
+    type: 'sync',
+    users: halls[username] || [],
+    config: Object.assign({ botEnabled: BOT_ENABLED, botMinMs: BOT_MIN_MS, botMaxMs: BOT_MAX_MS }, SOUND_CONFIG),
+  });
+
+  startTikTok(room);   // no-op if already connected / retrying
+
+  socket.on('disconnect', () => {
+    room.clients = Math.max(0, room.clients - 1);
+    console.log(`[${username}] overlay left (${room.clients} client(s))`);
+    if (room.clients === 0 && !room.graceTimer) {
+      room.graceTimer = setTimeout(() => { room.graceTimer = null; if (room.clients === 0) closeRoom(room); }, GRACE_MS);
+    }
+  });
+  socket.on('error', (e) => console.error(`[${username}] socket error:`, (e && e.message) || e));
+});
+
+/* ------------------------------------------------------------------ */
+/*  HTTP routes (all need ?username=)                                  */
+/*    /test?username=abc&name=Hung&gift=Rose&count=3                   */
+/*    /test?username=abc&name=Guest&n=20                               */
+/*    /reset?username=abc      /bot?username=abc                       */
+/* ------------------------------------------------------------------ */
+app.get('/healthz', (req, res) => res.status(200).send('ok'));   // Render health check
+
+app.get('/test', (req, res) => {
+  res.status(200).send('OK');
   try {
     const q = req.query || {};
+    const room = rooms.get(normalizeUsername(q.username));
+    if (!room) return console.log('[TEST] no open overlay for that username');
     const name = safeStr(q.name, 40, 'Test User');
     const giftName = safeStr(q.gift, 30, 'Rose');
     const count = Math.max(1, parseInt(safeStr(q.count, 10, '1'), 10) || 1);
@@ -186,189 +294,80 @@ app.get('/test', (req, res) => {
       setTimeout(() => {
         try {
           const nick = n > 1 ? `${name} ${i + 1}` : name;
-          sendGift(
-            { userId: `test-${nick}`, nickname: nick, profilePictureUrl: pic },
-            { giftName, count, giftPictureUrl: '' },
-            false
-          );
-        } catch (e) {
-          console.error('[TEST] gift failed:', e && e.message);
-        }
+          sendGift(room, { userId: `test-${nick}`, nickname: nick, profilePictureUrl: pic },
+            { giftName, count, giftPictureUrl: '' }, false);
+        } catch (e) { console.error('[TEST] gift failed:', e && e.message); }
       }, i * 800);
     }
-    console.log(`[TEST] ${n} gift(s): ${name} sent ${giftName} x${count}`);
-  } catch (e) {
-    console.error('[TEST] bad request ignored:', e && e.message);
-  }
+  } catch (e) { console.error('[TEST] bad request ignored:', e && e.message); }
 });
 
-// Clear the remembered hall (all real devotees go away, bots fill the seats again)
 app.get('/reset', (req, res) => {
   res.status(200).send('Hall reset. Overlay will reload.');
   try {
-    hall = [];
+    const username = normalizeUsername(req.query && req.query.username);
+    if (!username) return;
+    delete halls[username];
     saveHall();
-    broadcast({ type: 'reset' });
-  } catch (e) {
-    console.error('[RESET] failed:', e && e.message);
-  }
+    const room = rooms.get(username);
+    if (room) emitTo(room, 'reset');
+  } catch (e) { console.error('[RESET] failed:', e && e.message); }
 });
 
-// Spawn one bot right now (to preview the idle loop):  http://localhost:5000/bot
 app.get('/bot', (req, res) => {
   res.status(200).send('OK');
-  try { broadcast({ type: 'bot' }); } catch (e) { console.error('[BOT] failed:', e && e.message); }
+  try {
+    const room = rooms.get(normalizeUsername(req.query && req.query.username));
+    if (room) emitTo(room, 'bot');
+  } catch (e) { console.error('[BOT] failed:', e && e.message); }
 });
 
+/* ------------------------------------------------------------------ */
+/*  Static files from the project root (allow-list; code/data private) */
+/* ------------------------------------------------------------------ */
+const SERVED_EXT = new Set([
+  '.html', '.css', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg',
+  '.mp4', '.webm', '.mp3', '.ogg', '.wav', '.m4a', '.woff', '.woff2', '.ttf', '.ico',
+]);
+const PRIVATE_FILES = new Set(['server.js', 'hall.json', 'package.json', 'package-lock.json']);
+const staticFiles = express.static(__dirname, { index: false, dotfiles: 'ignore', fallthrough: true });
+
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
-// Top-level files only (no sub-folders, no dotfiles), allowed extensions, never server code / hall.json
 app.use((req, res, next) => {
   if (req.method !== 'GET' && req.method !== 'HEAD') return next();
   if (!/^\/[^/]+$/.test(req.path)) return next();
-  const name = safeDecode(req.path.slice(1)).toLowerCase();   // never throws on malformed % sequences
-  if (name.includes('..') || name.includes('\\') || name.startsWith('.') || PRIVATE_FILES.has(name) || !SERVED_EXT.has(path.extname(name))) return next();
+  const name = safeDecode(req.path.slice(1)).toLowerCase();
+  if (name.includes('..') || name.includes('\\') || name.startsWith('.') ||
+      PRIVATE_FILES.has(name) || !SERVED_EXT.has(path.extname(name))) return next();
   try { staticFiles(req, res, next); } catch (e) { next(); }
 });
 
-// Last-resort Express error handler: a bad request gets a plain reply, never a crash
 app.use((err, req, res, next) => {
   console.error('[HTTP] request error:', err && err.message);
   if (res.headersSent) return;
-  try { res.status(200).send('OK'); } catch (e) { /* socket already gone */ }
+  try { res.status(200).send('OK'); } catch (e) { /* socket gone */ }
 });
 
-wss.on('error', (err) => console.error('[WSS] error:', (err && err.message) || err));
-server.on('error', (err) => {
-  console.error('[SERVER] error:', (err && err.message) || err,
-    err && err.code === 'EADDRINUSE' ? `(port ${PORT} is already used by another program)` : '');
-});
-server.on('clientError', (err, socket) => {
-  try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch (e) { /* ignore */ }
-});
-
-wss.on('connection', (ws) => {
-  console.log(`[WS] overlay connected (${wss.clients.size} client(s))`);
-  ws.on('error', (err) => console.error('[WS] client error:', (err && err.message) || err));
-  // Tell the overlay who is already sitting in the hall
-  try {
-    ws.send(JSON.stringify({
-      type: 'sync',
-      users: hall,
-      config: Object.assign(
-        { botEnabled: BOT_ENABLED, botMinMs: BOT_MIN_MS, botMaxMs: BOT_MAX_MS },
-        SOUND_CONFIG
-      ),
-    }));
-  } catch (e) {
-    console.error('[WS] sync failed:', e && e.message);
-  }
-});
-
-/* ------------------------------------------------------------------ */
-/*  TikFinity connection - listens ONLY to the "gift" event            */
-/*  TikFinity sends JSON like:  { "event": "gift", "data": { ... } }   */
-/* ------------------------------------------------------------------ */
-let tikfinityWs = null;
-let reconnectTimer = null;
-let lastGiftKey = '';
-let lastGiftAt = 0;
-
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  console.log(`[TikFinity] retrying in ${RECONNECT_DELAY_MS / 1000}s...`);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectTikFinity();
-  }, RECONNECT_DELAY_MS);
-}
-
-function handleTikFinityMessage(raw) {
-  let msg;
-  try {
-    msg = JSON.parse(raw.toString());
-  } catch (e) {
-    return; // ignore non-JSON frames
-  }
-
-  // Be tolerant about the envelope: { event, data } or { type, data } or a bare event
-  const eventName = msg.event || msg.type || msg.eventName;
-  if (eventName !== 'gift') return;
-
-  const data = msg.data || msg.payload || msg;
-  const gift = getGift(data);
-
-  // Streakable gifts (e.g. Rose) can fire many events while tapping.
-  // If TikFinity marks the streak as still running, wait for the final one.
-  if (gift.giftType === 1 && data.repeatEnd === false) return;
-
-  const user = getUser(data);
-
-  // Safety net against the same gift being delivered twice in a row
-  const key = `${user.userId}|${gift.giftName}|${gift.count}|${data.msgId || data.giftId || ''}`;
-  const now = Date.now();
-  if (data.msgId && key === lastGiftKey && now - lastGiftAt < 1000) return;
-  lastGiftKey = key;
-  lastGiftAt = now;
-
-  console.log(`[GIFT] ${user.nickname} sent ${gift.giftName} x${gift.count}`);
-  sendGift(user, gift, true);
-}
-
-function connectTikFinity() {
-  console.log(`[TikFinity] connecting to ${TIKFINITY_WS_URL} ...`);
-  const ws = new WebSocket(TIKFINITY_WS_URL);
-  tikfinityWs = ws;
-
-  ws.on('open', () => {
-    console.log('[TikFinity] connected - waiting for gifts');
-  });
-
-  ws.on('message', (raw) => {
-    try { handleTikFinityMessage(raw); } catch (e) {
-      console.error('[TikFinity] message ignored:', e && e.message);
-    }
-  });
-
-  ws.on('close', () => {
-    console.log('[TikFinity] disconnected');
-    if (tikfinityWs === ws) scheduleReconnect();
-  });
-
-  ws.on('error', (err) => {
-    // 'close' fires right after 'error', which schedules the reconnect
-    console.error('[TikFinity] error:', (err && err.message) || err,
-      '(is TikFinity Desktop running?)');
-  });
-}
+server.on('error', (err) => console.error('[SERVER] error:', (err && err.message) || err));
+server.on('clientError', (err, socket) => { try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch (e) { /* ignore */ } });
 
 server.listen(PORT, () => {
-  const hasVideo = fs.existsSync(path.join(__dirname, 'altar.mp4'));
-  console.log(`Sayadaw Dhamma Preaching Live overlay:  http://localhost:${PORT}`);
-  console.log(`Background: ${hasVideo ? 'altar.mp4 (looping video)' : 'altar.png (no altar.mp4 found)'}`);
-  const hasDhamma = fs.existsSync(path.join(__dirname, 'dhamma.mp3'));
-  const SPRITES = [
-    'boy_walk_back.png', 'boy_bow_back.png', 'boy_pray_front.png', 'boy_sit_back.png',
-    'girl_walk_back.png', 'girl_bow_back.png', 'girl_pray_front.png', 'girl_sit_back.png', 'altar.png',
-  ];
-  const missing = SPRITES.filter((f) => !fs.existsSync(path.join(__dirname, f)));
-  console.log(missing.length
-    ? `WARNING:  missing image(s) in ${__dirname}: ${missing.join(', ')}`
-    : 'Sprites:  all 8 character sprites + altar.png found');
-  console.log(`Chant:    ${hasDhamma ? 'dhamma.mp3 (looping)' : 'no dhamma.mp3 (silent - use OBS Desktop Audio if you like)'}`);
-  console.log(`Test:     http://localhost:${PORT}/test?name=Guest&n=20`);
-  console.log(`Offerings: /test?gift=Rose (flowers)  /test?gift=Candle (candlelight)  /test?gift=Galaxy (stardust)`);
-  console.log(`Tuning:   http://localhost:${PORT}/?debug=1`);
-  console.log(`Reset:    http://localhost:${PORT}/reset`);
-  console.log(`Bot now:  http://localhost:${PORT}/bot`);
-  connectTikFinity();
+  console.log(`Sayadaw Dhamma Preaching Live overlay listening on port ${PORT}`);
+  console.log(`OBS URL:  /?username=TIKTOK_USERNAME`);
+  console.log(`Test:     /test?username=TIKTOK_USERNAME&name=Guest&n=20`);
 });
 
 /* ------------------------------------------------------------------ */
-/*  Crash protection: log the problem, keep the overlay running        */
+/*  Shutdown + crash protection                                        */
 /* ------------------------------------------------------------------ */
-process.on('uncaughtException', (err) => {
-  console.error('Caught exception:', err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled Rejection:', reason);
-});
+function shutdown() {
+  console.log('Shutting down - releasing TikTok connections');
+  for (const room of Array.from(rooms.values())) { try { closeRoom(room); } catch (e) { /* ignore */ } }
+  try { fs.writeFileSync(HALL_FILE, JSON.stringify(halls, null, 1)); } catch (e) { /* ignore */ }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+process.on('uncaughtException', (err) => console.error('Caught exception:', err));
+process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
