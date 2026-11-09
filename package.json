@@ -1,0 +1,14 @@
+{
+  "name": "tiktok-altar-gift-overlay",
+  "version": "2.0.0",
+  "description": "TikTok Live gift overlay: devotees walk to the Buddha altar and prostrate 3 times",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "tiktok-live-connector": "^1.2.3",
+    "ws": "^8.18.0"
+  }
+}

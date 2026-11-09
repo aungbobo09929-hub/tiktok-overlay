@@ -1,0 +1,1149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sayadaw Dhamma Preaching Live</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="stage">
+    <div id="banners"></div>
+  </div>
+
+  <script>
+  (() => {
+    'use strict';
+
+    /* ============================================================ */
+    /*  SETTINGS - tune these for your altar.png                     */
+    /*  Coordinates are in the 1080 x 1920 stage.                    */
+    /*  Open  /?debug=1  to see bowing spots (green) + seats (blue). */
+    /* ============================================================ */
+    const CFG = {
+      W: 1080, H: 1920,
+
+      // ---- Devotee size ----
+      // Indoor monastery hall: every devotee (sprite, shadows, name tag position) is drawn 18% larger.
+      // Use 1.15 - 1.20 for a slightly smaller / larger crowd. The name tags keep their size.
+      devoteeScale: 1.18,
+
+      // ---- Hall layout, in PERCENT of the 1080 x 1920 stage (x = % of width, y = % of height) ----
+      // 20 devotees: 10 left + 10 right, each side 5 rows x 2 columns.
+      seatRowsLeftPct:  [63, 70, 77, 84, 91],     // Row 1 (far) ... Row 5 (near): 7% apart
+      seatRowsRightPct: [63, 70, 77, 84, 91],
+      seatColsLeftPct:  [18, 35],                 // left block:  outer, inner
+      seatColsRightPct: [82, 65],                 // right block: outer, inner
+      // The centre aisle between x = 35% and x = 65% is the walkway.
+
+      entrance: { x: 50, y: 96 },                 // bottom centre: where devotees appear (and bots leave)
+      // Bowing spots in front of the Sayadaw. The first one is THE bowing point (50%, 58%) and is
+      // always used first; the others only fill in when several people bow at the same time.
+      // Keep every spot ABOVE seat Row 1 (y < 63%) so nobody has to walk "up" to reach a seat.
+      bowSpotsPct: [[50, 58], [41, 59.5], [59, 59.5], [50, 61]],
+      maxQueue: 40,             // extra gifts wait in line when all bowing spots are busy
+      maxRepeatBows: 5,         // max extra bow sessions stored for one user who sends many gifts
+
+      // Perspective: scale depending on the feet y-position
+      farY: 1100,  farScale: 0.46,    // near the Sayadaw's platform steps
+      nearY: 1880, nearScale: 1.15,   // foreground
+
+      fadeMs: 1800,             // fade-out time of a replaced devotee
+      bannerMs: 5000,           // how long a gift banner stays
+      maxBanners: 4,            // banners visible at once
+      syncWaitMs: 1500,         // wait this long for the server's saved hall
+
+      // Anti-static idle loop: a BOT devotee walks in, bows 3x and sits down.
+      // (the server can override these via BOT_* in server.js, or use
+      //  ?botMin=8&botMax=12 in the URL, values in seconds; ?bots=0 turns bots off)
+      botEnabled: true,
+      botMinMs: 10000,          // shortest wait between two bots
+      botMaxMs: 15000,          // longest wait between two bots
+      botMaxWalking: 2,         // bots allowed on the floor at the same time
+      botMinFreeSpots: 2,       // bots never take the last bowing spots: real users first
+      botRetryMs: 3000,         // re-check this often while a real user is busy
+
+      // Background chanting loop (dhamma.mp3). The server can override this via SOUND_CONFIG.
+      dhammaVolume: 0.5,
+
+      // Offerings (flowers / candlelight / stardust) drift toward the Sayadaw's offering table
+      altarX: 540, altarY: 860,
+
+      // Show Burmese names for common gifts (edit GIFT_MY below to add more)
+      translateGifts: true,
+    };
+    CFG.spawnX = Math.round(CFG.W * CFG.entrance.x / 100);
+    CFG.spawnY = Math.round(CFG.H * CFG.entrance.y / 100);
+
+    // Optional Burmese names for gifts (key = English gift name, lower case)
+    const GIFT_MY = {
+      'rose': 'နှင်းဆီပန်း',
+      'lotus': 'ကြာပန်း',
+      'flower': 'ပန်း',
+      'candle': 'ဖယောင်းတိုင်',
+      'lamp': 'ဆီမီး',
+      'heart': 'နှလုံးသား',
+    };
+
+    // Bowing positions in front of the Sayadaw (from CFG.bowSpotsPct)
+    const BOW_SPOTS = CFG.bowSpotsPct.map(([px, py]) => ({
+      x: Math.round(CFG.W * px / 100),
+      y: Math.round(CFG.H * py / 100),
+    }));
+
+    // Seats: 2 blocks (left / right) of 5 rows x 2 columns, all coordinates from CFG percentages.
+    // Each seat also gets gapY: the free lane just above its row, used by walkers so they
+    // never cross seated devotees (they walk down the lane, across the gap, then forward into the seat).
+    function calculateSeats() {
+      const px = (p) => Math.round(CFG.W * p / 100);
+      const out = [];
+      const block = (side, rows, cols) => {
+        rows.forEach((rowPct, i) => {
+          const stepPct = rows.length < 2 ? 7 : (i < rows.length - 1 ? rows[i + 1] - rowPct : rowPct - rows[i - 1]);
+          const y = Math.round(CFG.H * rowPct / 100);
+          const gapY = Math.round(y - (stepPct * CFG.H / 100) / 2);
+          cols.forEach((p) => out.push({ x: px(p), y, gapY, side, occupant: null, reservedBy: null }));
+        });
+      };
+      block('L', CFG.seatRowsLeftPct, CFG.seatColsLeftPct);
+      block('R', CFG.seatRowsRightPct, CFG.seatColsRightPct);
+      return out;
+    }
+    const seats = calculateSeats();
+
+    // 3 prostrations: kneel -> (down, up) x 3 -> stand   (silent)
+    const BOW_STEPS = [
+      { pose: 'kneel', dur: 0.9 },
+      { pose: 'pro',   dur: 1.3 },
+      { pose: 'kneel', dur: 0.8 },
+      { pose: 'pro',   dur: 1.3 },
+      { pose: 'kneel', dur: 0.8 },
+      { pose: 'pro',   dur: 1.3 },
+      { pose: 'kneel', dur: 0.8 },
+      { pose: 'stand', dur: 0.8 },
+    ];
+
+    // Pixar-style PNG sprites (put all 8 files in the project folder).
+    //   walk = back view walking up to the Sayadaw / standing
+    //   bow  = back view prostrating
+    //   pray = FRONT view walking to the seat (faces the viewer, so nobody moonwalks)
+    //   sit  = back view seated cross-legged, facing the Sayadaw
+    // A missing file falls back to the other gender's sprite of the same kind.
+    const SPRITE_FILES = {
+      boy:  { walk: 'boy_walk_back.png',  bow: 'boy_bow_back.png',  pray: 'boy_pray_front.png',  sit: 'boy_sit_back.png' },
+      girl: { walk: 'girl_walk_back.png', bow: 'girl_bow_back.png', pray: 'girl_pray_front.png', sit: 'girl_sit_back.png' },
+    };
+
+    const params = new URLSearchParams(location.search);
+    if (params.has('transparent')) document.body.classList.add('transparent');
+    if (params.has('botMin')) CFG.botMinMs = Math.max(1, Number(params.get('botMin')) || 10) * 1000;
+    if (params.has('botMax')) CFG.botMaxMs = Math.max(1, Number(params.get('botMax')) || 15) * 1000;
+    if (params.get('bots') === '0') CFG.botEnabled = false;
+
+    /* ============================================================ */
+    /*  Stage scaling (fit 1080x1920 into any OBS source size)       */
+    /* ============================================================ */
+    const stage = document.getElementById('stage');
+    const bannerBox = document.getElementById('banners');
+
+    function fit() {
+      const s = Math.min(innerWidth / CFG.W, innerHeight / CFG.H);
+      const ox = (innerWidth - CFG.W * s) / 2;
+      const oy = (innerHeight - CFG.H * s) / 2;
+      stage.style.transform = `translate(${ox}px, ${oy}px) scale(${s})`;
+    }
+    addEventListener('resize', fit);
+    fit();
+
+    /* ============================================================ */
+    /*  Background: altar.mp4 (looping video) if present,            */
+    /*  otherwise the static altar.png from style.css                */
+    /* ============================================================ */
+    function initVideo() {
+      if (params.has('transparent') || params.has('novideo')) return;
+      const v = document.createElement('video');
+      v.id = 'bgvideo';
+      v.muted = true;
+      v.defaultMuted = true;
+      v.loop = true;
+      v.autoplay = true;
+      v.playsInline = true;
+      v.preload = 'auto';
+      v.disablePictureInPicture = true;
+      v.setAttribute('muted', '');
+      v.setAttribute('playsinline', '');
+      v.setAttribute('loop', '');
+      v.setAttribute('autoplay', '');
+
+      v.addEventListener('playing', () => v.classList.add('ready'));   // fade the video in
+      v.addEventListener('error', () => v.remove());                  // no altar.mp4 -> altar.png stays
+      v.addEventListener('ended', () => { v.currentTime = 0; v.play().catch(() => {}); });
+
+      stage.insertBefore(v, stage.firstChild);
+      v.src = 'altar.mp4';
+      v.play().catch(() => {});
+
+      // Watchdog: restart the video if the browser/OBS ever pauses it
+      setInterval(() => {
+        if (v.isConnected && v.paused) v.play().catch(() => {});
+      }, 5000);
+    }
+    initVideo();
+
+    /* ============================================================ */
+    /*  Helpers                                                      */
+    /* ============================================================ */
+    const rand = (a, b) => a + Math.random() * (b - a);
+    const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+    function shuffle(arr) {
+      const a = arr.slice();
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    }
+
+    function hash(s) {
+      let h = 0;
+      for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+      return h;
+    }
+
+    // Perspective scale from the feet y-position
+    function sc(y) {
+      const t = (y - CFG.farY) / (CFG.nearY - CFG.farY);
+      return CFG.farScale + Math.min(1.1, Math.max(0, t)) * (CFG.nearScale - CFG.farScale);
+    }
+
+    function el(tag, cls, parent) {
+      const e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (parent) parent.appendChild(e);
+      return e;
+    }
+
+    const isUrl = (u) => /^https?:\/\//i.test(u || '');
+
+    // Fallback avatar: coloured circle with the first letter of the name
+    function fallbackAvatar(name) {
+      const colors = ['#e57373', '#64b5f6', '#81c784', '#ffb74d', '#ba68c8', '#4db6ac'];
+      const ch = (Array.from(String(name || '?').trim())[0] || '?').toUpperCase()
+        .replace(/[&<>"']/g, '?');
+      const svg =
+        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">` +
+        `<rect width="100" height="100" fill="${colors[hash(name) % colors.length]}"/>` +
+        `<text x="50" y="68" font-size="54" text-anchor="middle" fill="#fff" font-family="Arial">${ch}</text></svg>`;
+      return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+    }
+
+    /* ============================================================ */
+    /*  Debug markers                                                */
+    /* ============================================================ */
+    if (params.has('debug')) {
+      BOW_SPOTS.forEach((p, i) => {
+        const d = el('div', 'dot', stage);
+        d.style.left = p.x + 'px'; d.style.top = p.y + 'px';
+        el('span', '', d).textContent = 'B' + i;
+      });
+      seats.forEach((p, i) => {
+        const d = el('div', 'dot seat', stage);
+        d.style.left = p.x + 'px'; d.style.top = p.y + 'px';
+        el('span', '', d).textContent = 'S' + i;
+      });
+      const d = el('div', 'dot', stage);
+      d.style.left = CFG.altarX + 'px'; d.style.top = CFG.altarY + 'px';
+      d.style.background = '#ffd23a';
+      el('span', '', d).textContent = 'OFFERINGS';
+    }
+
+    /* ============================================================ */
+    /*  Background chanting: dhamma.mp3 (optional)                   */
+    /*  Missing file -> stays silent (let OBS Desktop Audio handle   */
+    /*  it).  URL: ?dhamma=0 disables, ?mute=1 mutes everything.     */
+    /*  Bowing itself is always silent.                              */
+    /* ============================================================ */
+    const MUTED = params.get('mute') === '1';
+
+    const Dhamma = (() => {
+      let a = null, blocked = false, faded = false, fadeTimer = null;
+      const enabled = !MUTED && params.get('dhamma') !== '0';
+
+      function fadeIn() {
+        clearInterval(fadeTimer);
+        let v = 0;
+        fadeTimer = setInterval(() => {
+          v += 0.02;
+          if (v >= CFG.dhammaVolume) { v = CFG.dhammaVolume; clearInterval(fadeTimer); }
+          if (a) a.volume = Math.max(0, Math.min(1, v));
+        }, 100);
+      }
+      function play() {
+        if (!a) return;
+        const p = a.play();
+        if (p && p.catch) p.catch((e) => {
+          if (e && e.name === 'NotAllowedError') blocked = true;   // autoplay policy
+        });
+      }
+      function start() {
+        if (!enabled) return;
+        a = new Audio();
+        a.loop = true;
+        a.preload = 'auto';
+        a.volume = 0;
+        a.addEventListener('playing', () => {
+          blocked = false;
+          if (!faded) { faded = true; fadeIn(); }
+        });
+        a.addEventListener('error', () => { a = null; blocked = false; });   // no dhamma.mp3: stay silent
+        a.src = 'dhamma.mp3';
+        play();
+        setInterval(() => { if (a && a.paused && !blocked) play(); }, 5000);   // watchdog
+      }
+      return {
+        start,
+        retry() { if (a && a.paused) play(); },
+        isBlocked() { return blocked; },
+        applyVolume() { if (a && faded) a.volume = CFG.dhammaVolume; },
+      };
+    })();
+    Dhamma.start();
+
+    // "Click anywhere to enable sound" - only shown when the browser blocks the chanting loop
+    const soundHint = el('div', 'soundhint', document.body);
+    soundHint.textContent = '🔔 Click anywhere to enable sound';
+    function refreshHint() {
+      soundHint.classList.toggle('show', !MUTED && !params.has('nohint') && Dhamma.isBlocked());
+    }
+    function unlockAudio() {
+      Dhamma.retry();
+      setTimeout(refreshHint, 400);
+    }
+    ['pointerdown', 'keydown', 'touchstart'].forEach((ev) =>
+      addEventListener(ev, unlockAudio, { passive: true }));
+    setInterval(refreshHint, 1000);
+
+    /* ============================================================ */
+    /*  Offerings: flowers / candlelight / stardust drift upward     */
+    /* ============================================================ */
+    const fxLayer = el('div', 'fx', stage);
+
+    function offeringKind(name) {
+      const n = String(name || '').toLowerCase();
+      if (/rose|flower|lotus|tulip|lily|orchid|jasmine|bouquet|blossom|peony|sakura|ပန်း|နှင်းဆီ|ကြာ|🌹|🌸|🌺|🪷/.test(n)) return 'flower';
+      if (/candle|heart|light|lamp|lantern|flame|fire|diya|glow|love|ဖယောင်း|ဆီမီး|မီး|နှလုံး|🕯|❤/.test(n)) return 'light';
+      return 'stardust';
+    }
+
+    function fly(node, frames, dur, delay) {
+      const a = node.animate(frames, { duration: dur, delay: delay || 0, easing: 'ease-out', fill: 'both' });
+      a.onfinish = () => node.remove();
+      return a;
+    }
+    function trimFx() {
+      while (fxLayer.childElementCount > 160) fxLayer.firstElementChild.remove();
+    }
+    function halo(size, delay, dur, peak) {
+      const h = el('div', 'halo', fxLayer);
+      h.style.width = h.style.height = size + 'px';
+      h.style.margin = (-size / 2) + 'px 0 0 ' + (-size / 2) + 'px';
+      fly(h, [
+        { transform: `translate(${CFG.altarX}px, ${CFG.altarY}px) scale(0.6)`, opacity: 0 },
+        { transform: `translate(${CFG.altarX}px, ${CFG.altarY}px) scale(1)`, opacity: peak, offset: 0.4 },
+        { transform: `translate(${CFG.altarX}px, ${CFG.altarY}px) scale(1.15)`, opacity: 0 },
+      ], dur, delay);
+    }
+
+    // Golden lotus / flower petals float up toward the Sayadaw's platform
+    function offerFlowers(count) {
+      const n = 10 + Math.min(count, 12) * 2;
+      for (let i = 0; i < n; i++) {
+        const p = el('div', 'petal ' + (Math.random() < 0.5 ? 'gold' : 'pink'), fxLayer);
+        const s = rand(0.7, 1.5);
+        const x0 = CFG.altarX + rand(-380, 380), y0 = rand(1250, 1480);
+        const x1 = CFG.altarX + rand(-170, 170), y1 = CFG.altarY + rand(-40, 70);
+        const xm = (x0 + x1) / 2 + rand(-90, 90), ym = y0 + (y1 - y0) * 0.55;
+        const r0 = rand(-60, 60);
+        fly(p, [
+          { transform: `translate(${x0}px, ${y0}px) rotate(${r0}deg) scale(${s * 0.4})`, opacity: 0 },
+          { transform: `translate(${x0 + rand(-30, 30)}px, ${y0 - 60}px) rotate(${r0 + 40}deg) scale(${s})`, opacity: 1, offset: 0.15 },
+          { transform: `translate(${xm}px, ${ym}px) rotate(${r0 + 160}deg) scale(${s})`, opacity: 1, offset: 0.6 },
+          { transform: `translate(${x1}px, ${y1}px) rotate(${r0 + 300}deg) scale(${s * 0.6})`, opacity: 0 },
+        ], rand(5200, 8200), rand(0, 1400));
+      }
+      halo(520, 4200, 3200, 0.55);
+    }
+
+    // Warm candlelight aura radiating in front of the platform
+    function offerCandles(count) {
+      const n = 3 + Math.min(count, 6);
+      const wrap = el('div', 'candles', fxLayer);
+      const aura = el('div', 'aura', wrap);
+      aura.style.left = CFG.altarX + 'px';
+      aura.style.top = (CFG.altarY + 40) + 'px';
+      for (let i = 0; i < n; i++) {
+        const c = el('div', 'candle', wrap);
+        c.style.left = (CFG.altarX + (i - (n - 1) / 2) * Math.min(90, 520 / n)) + 'px';
+        c.style.top = (CFG.altarY + 110 + (i % 2) * 18) + 'px';
+        const f = el('div', 'flame', c);
+        f.style.animationDelay = (-rand(0, 0.4)).toFixed(2) + 's';
+      }
+      const a = wrap.animate(
+        [{ opacity: 0 }, { opacity: 1, offset: 0.12 }, { opacity: 1, offset: 0.8 }, { opacity: 0 }],
+        { duration: 10000, easing: 'ease-in-out' });
+      a.onfinish = () => wrap.remove();
+    }
+
+    // Shimmering golden stardust blessing
+    function offerStardust(count) {
+      const n = 26 + Math.min(count, 12) * 3;
+      for (let i = 0; i < n; i++) {
+        const s = el('div', 'star', fxLayer);
+        const size = rand(5, 13);
+        s.style.width = s.style.height = size + 'px';
+        s.style.margin = (-size / 2) + 'px 0 0 ' + (-size / 2) + 'px';
+        const x0 = CFG.altarX + rand(-430, 430), y0 = CFG.altarY + rand(60, 420);
+        const x1 = x0 + (CFG.altarX - x0) * rand(0.1, 0.5) + rand(-40, 40), y1 = y0 - rand(180, 420);
+        fly(s, [
+          { transform: `translate(${x0}px, ${y0}px) scale(0.2)`, opacity: 0 },
+          { transform: `translate(${x0}px, ${y0 - 60}px) scale(1.3)`, opacity: 1, offset: 0.2 },
+          { transform: `translate(${(x0 + x1) / 2}px, ${(y0 + y1) / 2}px) scale(0.8)`, opacity: 0.6, offset: 0.5 },
+          { transform: `translate(${(x0 + x1) / 2 + rand(-20, 20)}px, ${y1 + 60}px) scale(1.2)`, opacity: 1, offset: 0.75 },
+          { transform: `translate(${x1}px, ${y1}px) scale(0.3)`, opacity: 0 },
+        ], rand(3200, 6000), rand(0, 1500));
+      }
+      halo(420, 1500, 3000, 0.35);
+    }
+
+    function spawnOffering(giftName, count) {
+      const k = offeringKind(giftName);
+      const c = Math.max(1, Number(count) || 1);
+      if (k === 'flower') offerFlowers(c);
+      else if (k === 'light') offerCandles(c);
+      else offerStardust(c);
+      trimFx();
+    }
+
+    /* ============================================================ */
+    /*  Gift banner (Burmese): merit-making + golden blessing        */
+    /* ============================================================ */
+    function showBanner(data) {
+      while (bannerBox.children.length >= CFG.maxBanners) {
+        bannerBox.removeChild(bannerBox.firstChild);
+      }
+      const wrap = el('div', 'bwrap', bannerBox);
+      const b = el('div', 'banner', wrap);
+
+      const icon = el('div', 'gicon', b);
+      if (isUrl(data.giftPictureUrl)) {
+        const gi = el('img', '', icon);
+        gi.alt = '';
+        gi.referrerPolicy = 'no-referrer';
+        gi.onerror = () => { gi.remove(); icon.textContent = '\uD83C\uDF81'; };
+        gi.src = data.giftPictureUrl;
+      } else {
+        icon.textContent = '\uD83C\uDF81';
+      }
+
+      const txt = el('div', 'txt', b);
+      const rawGift = String(data.giftName || 'Gift');
+      const giftLabel = (CFG.translateGifts && GIFT_MY[rawGift.toLowerCase()]) || rawGift;
+      el('span', '', txt).textContent = '✨ ';
+      el('span', 'who', txt).textContent = String(data.nickname || 'Guest');
+      el('span', '', txt).textContent = ' မှ ';
+      el('span', 'gift', txt).textContent = giftLabel;
+      el('span', 'cnt', txt).textContent = ' x' + (Number(data.count) || 1);
+      el('span', '', txt).textContent =
+        ' ဖြင့် ကုသိုလ်ပြု ကပ်လှူပါသည် 🙏 ✨';
+
+      // gentle golden floating blessing below the banner
+      el('div', 'blessing', wrap).textContent =
+        '“ပြုသမျှ ကုသိုလ်အစုစုအတွက် သာဓု... သာဓု... သာဓု ခေါ်ဆိုပါသည်”';
+
+      setTimeout(() => {
+        wrap.classList.add('leaving');
+        setTimeout(() => wrap.remove(), 520);
+      }, CFG.bannerMs);
+    }
+
+    /* ============================================================ */
+    /*  Devotee sprites: loading + switching                         */
+    /* ============================================================ */
+    const spriteState = {};            // file -> 'ok' | 'bad'
+    Object.values(SPRITE_FILES).forEach((g) => Object.values(g).forEach((f) => {
+      const im = new Image();
+      im.onload = () => { spriteState[f] = 'ok'; };
+      im.onerror = () => { spriteState[f] = 'bad'; refreshAllSprites(); };
+      im.src = f;                      // preload: no flicker when sprites switch
+    }));
+
+    function resolveSprite(gender, kind) {
+      const own = SPRITE_FILES[gender][kind];
+      if (spriteState[own] !== 'bad') return own;
+      const other = SPRITE_FILES[gender === 'boy' ? 'girl' : 'boy'][kind];
+      if (spriteState[other] !== 'bad') return other;
+      return null;                     // nothing available: devotee stays invisible (shadow + badge remain)
+    }
+
+    // Which sprite to show:
+    //   seated -> sit (back)   kneel/prostrate -> bow (back)
+    //   facing the viewer (walking to the seat) -> pray (front)   otherwise -> walk (back)
+    function spriteKind(root) {
+      if (root.classList.contains('p-sit')) return 'sit';
+      if (root.classList.contains('p-kneel') || root.classList.contains('p-pro')) return 'bow';
+      if (root.classList.contains('front')) return 'pray';
+      return 'walk';
+    }
+
+    function syncSprite(root) {
+      const img = root._sprite;
+      if (!img) return;
+      const kind = spriteKind(root);
+      const f = resolveSprite(root._gender, kind);
+      root.classList.remove('k-walk', 'k-bow', 'k-sit', 'k-pray');
+      root.classList.add('k-' + kind);
+      if (!f) { img.style.visibility = 'hidden'; return; }
+      img.style.visibility = '';
+      if (root._file !== f) { root._file = f; img.src = f; }
+    }
+    function refreshAllSprites() {
+      document.querySelectorAll('.devotee').forEach(syncSprite);
+    }
+
+    /* ============================================================ */
+    /*  Devotee: DOM  (PNG sprite character, male or female)         */
+    /*  bot = true  -> random devotee without a username badge       */
+    /*  Real users keep the same gender every time                   */
+    /*  (picked from a hash of their nickname).                      */
+    /* ============================================================ */
+    function buildDom(data, pose, bot) {
+      const root = el('div', 'devotee enter p-' + pose);
+      const key = bot ? Math.random() : data.nickname;
+      const female = bot ? Math.random() < 0.5 : (hash(key + 'g') % 2 === 1);
+      root.classList.add(female ? 'female' : 'male');
+      root._gender = female ? 'girl' : 'boy';
+
+      // ground shadows: long cast shadow, soft foot shadow, knee contact spots
+      el('div', 'cast', root);
+      el('div', 'shadow', root);
+      el('div', 'contact', root);
+
+      const lift = el('div', 'lift', root);   // as tall as the current sprite: the badge sits on top of it
+
+      if (!bot) {
+        // Badge: profile picture + username
+        const badge = el('div', 'badge', lift);
+        const inner = el('div', 'badge-in', badge);
+        const img = el('img', 'avatar', inner);
+        img.alt = '';
+        img.referrerPolicy = 'no-referrer';
+        const nickname = String(data.nickname || 'Guest');
+        img.onerror = () => { img.onerror = null; img.src = fallbackAvatar(nickname); };
+        img.src = isUrl(data.profilePictureUrl) ? data.profilePictureUrl : fallbackAvatar(nickname);
+        el('div', 'nick', inner).textContent = nickname;   // textContent = no HTML injection
+      }
+
+      const fig = el('div', 'fig', lift);     // walking bob / breathing / turning animations
+      const sprite = el('img', 'sprite', fig); // pose transforms (kneel / prostrate dip)
+      sprite.alt = '';
+      sprite.draggable = false;
+      sprite.onerror = () => {                 // file missing: mark it and pick a fallback
+        if (root._file) spriteState[root._file] = 'bad';
+        root._file = null;
+        syncSprite(root);
+      };
+      root._sprite = sprite;
+      syncSprite(root);
+
+      stage.appendChild(root);
+      void root.offsetWidth;            // force layout so the fade-in runs
+      root.classList.remove('enter');
+      return root;
+    }
+
+    /* ============================================================ */
+    /*  Devotee: state + helpers                                     */
+    /* ============================================================ */
+    const active = [];                  // everyone on stage (walking, seated, leaving)
+    const queue = [];                   // gifts waiting for a free bowing spot
+    const spotUsed = new Set();
+    const freeSpots = () => BOW_SPOTS.map((_, i) => i).filter((i) => !spotUsed.has(i));
+    const realById = new Map();         // userId -> devotee (walking or seated)
+
+    /* ============================================================ */
+    /*  Resource helpers: every lock a devotee takes is given back   */
+    /* ============================================================ */
+    function releaseSpot(d) {                              // bowing spot
+      if (!d.spotHeld) return;
+      spotUsed.delete(d.spotIdx);
+      d.spotHeld = false;
+    }
+
+    function cleanup(d) {                                  // undo visuals + locks
+      d.el.classList.remove('turning');
+      setWalking(d, false);
+      releaseSpot(d);
+      d.pendingBows = 0;
+    }
+
+    function hardRemove(d) {                               // last resort: the devotee leaves, nothing stays locked
+      try { cleanup(d); } catch (e) { /* keep going */ }
+      if (d.seat) {
+        if (d.seat.reservedBy === d) d.seat.reservedBy = null;
+        if (d.seat.occupant === d) d.seat.occupant = null;
+      }
+      if (d.homeSeat) { if (d.homeSeat.reservedBy === d) d.homeSeat.reservedBy = null; d.homeSeat = null; }
+      if (!d.isBot && realById.get(d.userId) === d) realById.delete(d.userId);
+      try { d.el.remove(); } catch (e) { /* ignore */ }
+      const i = active.indexOf(d);
+      if (i >= 0) active.splice(i, 1);
+      pump();
+    }
+
+    function sitDown(d) {                                  // put a devotee on its reserved seat right now
+      const seat = d.seat;
+      d.x = seat.x; d.y = seat.y; place(d);
+      d.el.classList.remove('front', 'turning');
+      setPose(d, 'sit');
+      d.phase = 'sit';
+      seat.occupant = d;
+      seat.reservedBy = null;
+      d.seatedAt = Date.now();
+    }
+
+    /* ============================================================ */
+    /*  SAFETY NET: no step can ever last forever                    */
+    /*  A step that is too slow OR throws ends up here: walking      */
+    /*  sprite back on, every lock released, devotee goes to a seat. */
+    /* ============================================================ */
+    const PHASE_LIMIT_S = {                                // wall-clock seconds
+      walkIn: 30, bow: 3.5 /* per bowing step */, waitSeat: 12,
+      turnExit: 3, exit: 20, turn1: 3, toSeat: 25, turn2: 3, standUp: 3, leaving: 8,
+    };
+
+    function recover(d, reason) {
+      const ph = d.phase;
+      console.warn(`[watchdog] ${reason}: "${d.nick || 'bot'}" was stuck in "${ph}" -> walking sprite, seat`);
+      if (++d.recovers > 4) { hardRemove(d); return; }
+      if (ph === 'leaving' || ph === 'exit' || ph === 'turnExit') { hardRemove(d); return; }
+
+      cleanup(d);
+      setPose(d, 'stand');                                 // standing + walking sprite (syncSprite)
+      d.el.classList.remove('front');
+      syncSprite(d.el);
+      place(d);
+      pump();
+
+      if ((ph === 'turn1' || ph === 'toSeat' || ph === 'turn2') && d.seat && d.seat.reservedBy === d) {
+        sitDown(d);                                        // the seat was already assigned: just sit
+      } else {
+        goToSeat(d);                                       // own seat / a new seat / bots leave
+      }
+    }
+
+    function watchdog(d, nowMs) {
+      const key = d.phase === 'bow' ? 'bow' + d.step : d.phase;   // each bowing step has its own limit
+      if (d._wdKey !== key) { d._wdKey = key; d._wdAt = nowMs; return; }
+      const lim = PHASE_LIMIT_S[d.phase];
+      if (!lim || (nowMs - d._wdAt) / 1000 <= lim) return;
+      d._wdAt = nowMs;
+      if (d.phase === 'bow') {                             // force the next bowing step
+        console.warn(`[watchdog] bowing step ${d.step} of "${d.nick || 'bot'}" forced on`);
+        d.t = BOW_STEPS[d.step].dur;
+        return;
+      }
+      recover(d, 'timeout');
+    }
+
+    // Locks are re-derived from the devotees themselves every frame, so a leak can never last
+    function sanity() {
+      spotUsed.clear();
+      for (const x of active) if (x.spotHeld) spotUsed.add(x.spotIdx);
+    }
+
+    function place(d) {
+      const s = sc(d.y) * CFG.devoteeScale;                  // perspective x indoor-hall enlargement
+      const bs = 0.7 + 0.3 * sc(d.y);                        // name tag size ignores the enlargement
+      const st = d.el.style;
+      st.setProperty('--s', s.toFixed(3));
+      st.setProperty('--bs', bs.toFixed(3));
+      st.transform = `translate(${d.x.toFixed(1)}px, ${d.y.toFixed(1)}px) scale(${s.toFixed(3)})`;
+      st.zIndex = String(Math.round(d.y));                   // nearer = in front
+    }
+
+    const setWalking = (d, on) => d.el.classList.toggle('walking', on);
+
+    function setPose(d, pose) {
+      d.el.classList.remove('p-stand', 'p-kneel', 'p-pro', 'p-sit');
+      d.el.classList.add('p-' + pose);
+      syncSprite(d.el);
+    }
+
+    // Turn around: squash sideways, swap back-view / front-view sprite in the middle
+    function turn(d, toFront) {
+      d.el.classList.add('turning');
+      setTimeout(() => { d.el.classList.toggle('front', toFront); syncSprite(d.el); }, 220);
+      setTimeout(() => d.el.classList.remove('turning'), 470);
+    }
+
+    // Walk along d.path; returns true when the last waypoint is reached
+    function follow(d, dt) {
+      const tgt = d.path[d.pi];
+      const dx = tgt.x - d.x, dy = tgt.y - d.y;
+      const dist = Math.hypot(dx, dy);
+      const step = (60 + 150 * sc(d.y)) * dt;   // faster up close, slower far away
+      if (dist <= step) {
+        d.x = tgt.x; d.y = tgt.y; place(d);
+        d.pi++;
+        return d.pi >= d.path.length;
+      }
+      d.x += (dx / dist) * step;
+      d.y += (dy / dist) * step;
+      place(d);
+      return false;
+    }
+
+    /* ============================================================ */
+    /*  The hall: seated devotees (bots + real users)                */
+    /* ============================================================ */
+    function createSeated(data, seat, bot) {
+      const d = {
+        el: buildDom(data, 'sit', bot),
+        x: seat.x, y: seat.y,
+        phase: 'sit', t: 0,
+        isBot: bot,
+        userId: bot ? null : String(data.userId || data.nickname),
+        nick: bot ? '' : String(data.nickname || 'Guest'),
+        seat,
+        seatedAt: Date.now(),
+        recovers: 0,
+      };
+      place(d);
+      seat.occupant = d;
+      active.push(d);
+      if (!bot) realById.set(d.userId, d);
+      return d;
+    }
+
+    let populated = false;
+    // Fill the hall: remembered real users first, bots in all remaining seats
+    function populate(users) {
+      if (populated) return;
+      populated = true;
+      const order = shuffle(seats.map((_, i) => i));
+      const recent = (users || []).slice(-seats.length);   // newest N viewers
+      recent.forEach((u, i) => {
+        const d = createSeated(u, seats[order[i]], false);
+        d.seatedAt = Date.now() - (recent.length - i) * 1000;  // keeps oldest-first order
+      });
+      for (let i = recent.length; i < seats.length; i++) {
+        createSeated(null, seats[order[i]], true);
+      }
+    }
+
+    // Seated devotee stands up and fades away
+    function evict(o) {
+      if (!o.isBot && realById.get(o.userId) === o) realById.delete(o.userId);
+      o.phase = 'leaving';
+      o.t = 0;
+      o.fadeStarted = false;
+      setPose(o, 'stand');
+    }
+
+    /* Pick a seat for a devotee who finished bowing (FIFO rotation):
+       1) empty seat   2) a seat held by a BOT (oldest bot is replaced)
+       3) the OLDEST seated real user is replaced (real users only)     */
+    function reserveSeat(walker) {
+      let cand = seats.filter((s) => !s.occupant && !s.reservedBy);
+      let seat = cand.length ? pick(cand) : null;
+
+      if (!seat) {
+        cand = seats
+          .filter((s) => !s.reservedBy && s.occupant && s.occupant.isBot && s.occupant.phase === 'sit')
+          .sort((a, b) => a.occupant.seatedAt - b.occupant.seatedAt);
+        if (cand.length) seat = cand[0];
+      }
+      if (!seat && !walker.isBot) {                // bots NEVER replace a real user
+        cand = seats
+          .filter((s) => !s.reservedBy && s.occupant && !s.occupant.isBot && s.occupant.phase === 'sit')
+          .sort((a, b) => a.occupant.seatedAt - b.occupant.seatedAt);
+        if (cand.length) seat = cand[0];
+      }
+      if (!seat) return null;
+
+      if (seat.occupant) {          // the old occupant stands up and fades out
+        evict(seat.occupant);
+        seat.occupant = null;
+      }
+      seat.reservedBy = walker;
+      return seat;
+    }
+
+    /* ============================================================ */
+    /*  Real users: queue + spawning                                 */
+    /* ============================================================ */
+    function pump() {
+      while (queue.length) {
+        const free = freeSpots();
+        if (!free.length) return;
+
+        const data = queue.shift();
+        const spotIdx = free[0];          // the main spot (50%, 58%) first, then the others
+        spotUsed.add(spotIdx);
+        const spot = BOW_SPOTS[spotIdx];
+
+        const d = {
+          el: buildDom(data, 'stand', false),
+          x: CFG.spawnX + rand(-8, 8),
+          y: CFG.spawnY,
+          spotIdx, spot,
+          phase: 'walkIn',
+          t: 0, step: 0,
+          isBot: false,
+          userId: String(data.userId || data.nickname),
+          nick: String(data.nickname || 'Guest'),
+          seat: null,
+          pendingBows: Math.min(CFG.maxRepeatBows, data.extra || 0),   // gifts sent while waiting in line
+          spotHeld: true, recovers: 0,
+          path: [{ x: spot.x, y: spot.y }], pi: 0,
+        };
+        realById.set(d.userId, d);
+        setWalking(d, true);
+        place(d);
+        active.push(d);
+      }
+    }
+
+    function onGift(data) {
+      if (!populated) populate([]);              // make sure the hall exists
+      showBanner(data);                          // Burmese merit banner + blessing
+      spawnOffering(data.giftName, data.count);  // flowers / candlelight / stardust
+
+      const uid = String(data.userId || data.nickname);
+      const existing = realById.get(uid);
+      if (existing) {
+        // Every extra gift = one more bow session:
+        //  - seated        -> stands up, walks to the front, bows 3x, returns to the same seat
+        //  - walking/bowing -> bows again right after the current session
+        existing.pendingBows = Math.min(CFG.maxRepeatBows, (existing.pendingBows || 0) + 1);
+        if (existing.phase === 'sit') existing.seatedAt = Date.now();
+        return;
+      }
+      const waiting = queue.find((q) => String(q.userId || q.nickname) === uid);
+      if (waiting) {                             // still in line: remember the extra bow
+        waiting.extra = Math.min(CFG.maxRepeatBows, (waiting.extra || 0) + 1);
+        return;
+      }
+      if (queue.length < CFG.maxQueue) {
+        queue.push(data);
+        pump();
+      }
+    }
+
+    /* ============================================================ */
+    /*  Idle loop: BOT devotees keep the screen moving               */
+    /*  Same route as a real user: walk up -> 3 prostrations -> seat  */
+    /*  but no badge, no banner. Real users always have priority.    */
+    /* ============================================================ */
+    function realBusy() {
+      return queue.length > 0 ||
+        active.some((d) => !d.isBot && (d.phase === 'walkIn' || d.phase === 'bow'));
+    }
+    function botsOnFloor() {
+      return active.filter((d) => d.isBot && d.phase !== 'sit' && d.phase !== 'leaving').length;
+    }
+
+    function spawnBot() {
+      const free = freeSpots();
+      if (free.length < CFG.botMinFreeSpots) return false;   // keep spots for real users
+      const spotIdx = free[0];
+      spotUsed.add(spotIdx);
+      const spot = BOW_SPOTS[spotIdx];
+      const d = {
+        el: buildDom(null, 'stand', true),
+        x: CFG.spawnX + rand(-8, 8),
+        y: CFG.spawnY,
+        spotIdx, spot,
+        phase: 'walkIn',
+        t: 0, step: 0,
+        isBot: true,
+        userId: null,
+        seat: null,
+        spotHeld: true, recovers: 0,
+        path: [{ x: spot.x, y: spot.y }], pi: 0,
+      };
+      setWalking(d, true);
+      place(d);
+      active.push(d);
+      return true;
+    }
+
+    // Bot finished bowing but every seat belongs to a real user: walk out and fade
+    function beginExit(d) {
+      d.phase = 'turnExit';
+      d.t = 0;
+      turn(d, true);                             // face the viewer while walking out
+    }
+
+    function botLoop() {
+      let delay = rand(CFG.botMinMs, CFG.botMaxMs);
+      if (CFG.botEnabled && populated && !realBusy() && botsOnFloor() < CFG.botMaxWalking) {
+        spawnBot();
+      } else {
+        delay = CFG.botRetryMs;     // a real user is busy (or too many bots): check again soon
+      }
+      setTimeout(botLoop, delay);
+    }
+    setTimeout(botLoop, 4000);
+
+    /* ============================================================ */
+    /*  Repeat bowing: a SEATED real user sent another gift          */
+    /*  stand up -> walk to a free bowing spot -> 3 prostrations     */
+    /*  -> walk back to the SAME seat (kept reserved meanwhile)      */
+    /* ============================================================ */
+    function tryRebow(d) {
+      if (queue.length) return;                  // brand-new users in line go first
+      const free = freeSpots();
+      if (!free.length) return;                  // all spots busy: try again next frame
+
+      const spotIdx = free[0];
+      spotUsed.add(spotIdx);
+      const spot = BOW_SPOTS[spotIdx];
+      d.pendingBows--;
+      d.spotIdx = spotIdx;
+      d.spot = spot;
+      d.spotHeld = true;
+
+      const seat = d.seat;
+      seat.occupant = null;                      // seat is empty but reserved for its owner
+      seat.reservedBy = d;
+      d.homeSeat = seat;
+
+      // up to the free lane above the seat row, sideways to the owner's lane, then up the aisle
+      const wy = Math.max(spot.y, seat.gapY);
+      d.path = [
+        { x: seat.x, y: wy },
+        { x: spot.x, y: wy },
+        { x: spot.x, y: spot.y },
+      ];
+      d.pi = 0;
+      setPose(d, 'stand');                       // stand up from the seated pose
+      d.phase = 'standUp';
+      d.t = 0;
+    }
+
+    // After bowing: own seat (repeat bower), a new seat, or out (bots when the hall is full of real users)
+    function goToSeat(d) {
+      let seat = null;
+      if (d.homeSeat) { seat = d.homeSeat; d.homeSeat = null; }   // back to own seat
+      else seat = reserveSeat(d);
+      if (seat) beginSeatWalk(d, seat);
+      else if (d.isBot) beginExit(d);
+      else d.phase = 'waitSeat';
+    }
+
+    function beginSeatWalk(d, seat) {
+      d.seat = seat;
+      d.phase = 'turn1';
+      d.t = 0;
+      turn(d, true);                             // face the viewer: walk to the seat forwards, not backwards
+    }
+
+    /* ============================================================ */
+    /*  Main loop                                                    */
+    /*  walk up -> 3 prostrations -> turn -> walk down the centre    */
+    /*  aisle -> sit (stays). A seated devotee only leaves when a    */
+    /*  newer devotee replaces them (FIFO).                          */
+    /* ============================================================ */
+    function update(d, dt) {
+      switch (d.phase) {
+        case 'walkIn':
+          if (follow(d, dt)) {
+            setWalking(d, false);
+            d.phase = 'bow'; d.step = 0; d.t = 0;
+            setPose(d, BOW_STEPS[0].pose);
+          }
+          break;
+
+        case 'bow': {
+          d.t += dt;
+          const st = BOW_STEPS[d.step];
+          if (d.t >= st.dur) {
+            d.t -= st.dur;
+            d.step++;
+            if (d.step >= BOW_STEPS.length) {
+              if (d.pendingBows > 0) {           // more gifts arrived: bow again right here
+                d.pendingBows--;
+                d.step = 0;
+                setPose(d, BOW_STEPS[0].pose);
+              } else {
+                releaseSpot(d);                  // bowing spot is free again
+                pump();
+                goToSeat(d);
+              }
+            } else {
+              setPose(d, BOW_STEPS[d.step].pose);
+            }
+          }
+          break;
+        }
+
+        case 'waitSeat': {
+          const seat = reserveSeat(d);
+          if (seat) beginSeatWalk(d, seat);
+          break;
+        }
+
+        case 'turnExit':
+          d.t += dt;
+          if (d.t >= 0.5) {
+            d.path = [{ x: d.x, y: CFG.spawnY }];
+            d.pi = 0;
+            setWalking(d, true);
+            d.phase = 'exit';
+          }
+          break;
+
+        case 'exit':
+          if (follow(d, dt)) {
+            setWalking(d, false);
+            d.phase = 'leaving';
+            d.t = 0.7;                           // skip the "stand up" wait, fade right away
+            d.fadeStarted = false;
+          }
+          break;
+
+        case 'turn1':
+          d.t += dt;
+          if (d.t >= 0.5) {
+            // down the centre aisle (it is clear), sideways along the free lane between two rows,
+            // then forward into the seat
+            const wy = Math.max(d.y, d.seat.gapY);   // never walk upwards (front-view sprite)
+            const laneX = (d.x < 450 || d.x > 630) ? CFG.W / 2 : d.x;   // always down the centre aisle
+            d.path = [
+              { x: laneX, y: d.y },
+              { x: laneX, y: wy },
+              { x: d.seat.x, y: wy },
+              { x: d.seat.x, y: d.seat.y },
+            ];
+            d.pi = 0;
+            setWalking(d, true);
+            d.phase = 'toSeat';
+          }
+          break;
+
+        case 'toSeat':
+          if (follow(d, dt)) {
+            setWalking(d, false);
+            d.phase = 'turn2'; d.t = 0;
+            turn(d, false);                      // arrived: turn back to face the Sayadaw
+          }
+          break;
+
+        case 'turn2':
+          d.t += dt;
+          if (d.t >= 0.5) {
+            setPose(d, 'sit');                   // sit cross-legged, facing the Sayadaw
+            d.phase = 'sit';
+            d.seat.occupant = d;
+            d.seat.reservedBy = null;
+            d.seatedAt = Date.now();
+          }
+          break;
+
+        case 'sit':
+          if (d.pendingBows > 0) tryRebow(d);    // extra gift -> go and bow again
+          break;                                 // otherwise stays until replaced
+
+        case 'standUp':
+          d.t += dt;
+          if (d.t >= 0.7) {
+            setWalking(d, true);
+            d.phase = 'walkIn';                  // same walk -> bow flow as a new user
+          }
+          break;
+
+        case 'leaving':
+          d.t += dt;
+          if (d.t >= 0.7 && !d.fadeStarted) {    // stand up first, then fade out
+            d.fadeStarted = true;
+            d.el.classList.add('fading');
+          }
+          if (d.t >= 0.7 + CFG.fadeMs / 1000) {
+            d.el.remove();
+            const i = active.indexOf(d);
+            if (i >= 0) active.splice(i, 1);
+          }
+          break;
+      }
+    }
+
+    let last = performance.now(), lastStepAt = last;
+    function step(now) {
+      const gap = now - lastStepAt;
+      lastStepAt = now;
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      // the page was suspended (hidden tab / OBS pause): that is not the devotees' fault
+      if (gap > 1000) for (const d of active) if (d._wdAt) d._wdAt += gap;
+      for (const d of active.slice()) {
+        try {
+          update(d, dt);
+          watchdog(d, now);
+        } catch (err) {                                    // walking sprite + seat, whatever happened
+          console.error('[devotee] error in phase', d && d.phase, err);
+          try {
+            d.errors = (d.errors || 0) + 1;
+            if (d.errors > 3) hardRemove(d); else recover(d, 'error');
+          } catch (e2) {
+            try { hardRemove(d); } catch (e3) { /* nothing more to do */ }
+          }
+        }
+      }
+      try { sanity(); } catch (e) { console.error('[sanity]', e); }
+    }
+    function tick(now) {
+      requestAnimationFrame(tick);                         // FIRST: whatever happens below, the loop keeps running
+      try { step(now); } catch (e) { console.error('[tick]', e); }
+    }
+    requestAnimationFrame(tick);
+
+    /* ============================================================ */
+    /*  WebSocket (auto-reconnect)                                   */
+    /* ============================================================ */
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.host}`);
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'sync') {                          // saved hall from the server
+            if (msg.config && !params.has('botMin') && !params.has('botMax')) {
+              const c = msg.config;
+              if (typeof c.botEnabled === 'boolean' && params.get('bots') !== '0') CFG.botEnabled = c.botEnabled;
+              if (c.botMinMs > 0) CFG.botMinMs = c.botMinMs;
+              if (c.botMaxMs >= CFG.botMinMs) CFG.botMaxMs = c.botMaxMs;
+            }
+            if (msg.config && typeof msg.config.dhammaVolume === 'number' && msg.config.dhammaVolume >= 0) {
+              CFG.dhammaVolume = msg.config.dhammaVolume;
+              Dhamma.applyVolume();
+            }
+            populate(msg.users);
+          }
+          else if (msg.type === 'bot') spawnBot();            // /bot test link
+          else if (msg.type === 'gift') onGift(msg);          // ONLY gifts spawn real users
+          else if (msg.type === 'reset') location.reload();
+        } catch (e) { /* ignore bad messages */ }
+      };
+      ws.onclose = () => setTimeout(connect, 2000);
+      ws.onerror = () => ws.close();
+    }
+    connect();
+
+    // If the server never answers, still show a hall full of bots
+    setTimeout(() => populate([]), CFG.syncWaitMs);
+  })();
+  </script>
+</body>
+</html>

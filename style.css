@@ -1,0 +1,480 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+  font-family: "Segoe UI", "Noto Sans", "Noto Sans Myanmar", "Myanmar Text", "Pyidaungsu", "Padauk", Arial, sans-serif;
+}
+body.transparent { background: transparent; }
+
+/* ---------- Stage: fixed 1080x1920 (9:16), scaled to fit by JS ---------- */
+#stage {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1080px;
+  height: 1920px;
+  transform-origin: 0 0;
+  overflow: hidden;
+  /* altar.png = the monastery Dhamma hall photo. Gradient is only a fallback. */
+  background:
+    url("altar.png") center / cover no-repeat,
+    linear-gradient(#6b4a0c, #e0a82e);
+}
+body.transparent #stage { background: none; }
+
+/* ---------- Looping video background (altar.mp4) ---------- */
+/* Sits on top of the altar.png fallback and fades in once it is playing */
+#bgvideo {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 0;
+  opacity: 0;
+  transition: opacity 0.6s ease;
+  pointer-events: none;
+}
+#bgvideo.ready { opacity: 1; }
+body.transparent #bgvideo { display: none; }
+
+/* ---------- Debug markers (?debug=1) ---------- */
+.dot {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0 -8px;
+  border-radius: 50%;
+  background: #22e06b;
+  z-index: 99999;
+  font-size: 18px;
+  color: #fff;
+  text-shadow: 0 0 3px #000;
+}
+.dot.seat { background: #38a8ff; }
+.dot span { position: absolute; left: 14px; top: -6px; white-space: nowrap; }
+
+/* ================================================================== */
+/*  Gift banners:  "[Username] sent [Gift] x[Count]"                    */
+/* ================================================================== */
+#banners {
+  position: absolute;
+  z-index: 100000;
+  top: 130px;
+  left: 50%;
+  width: 960px;
+  margin-left: -480px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  pointer-events: none;
+}
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: 940px;
+  padding: 10px 30px 10px 14px;
+  border-radius: 44px;
+  text-align: center;
+  background: linear-gradient(90deg, rgba(60, 12, 8, 0.92), rgba(120, 30, 12, 0.92));
+  border: 3px solid #f5c84c;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
+  color: #fff4d0;
+  font-size: 30px;
+  line-height: 1.8;            /* Myanmar script needs generous line height */
+  font-weight: 700;
+  text-shadow: 0 2px 3px #000;
+  animation: bannerIn 0.45s cubic-bezier(0.2, 1.2, 0.4, 1) both;
+}
+.bwrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.bwrap.leaving { animation: bannerOut 0.5s ease forwards; }
+
+/* gentle golden floating blessing under each banner */
+.blessing {
+  max-width: 900px;
+  text-align: center;
+  font-size: 25px;
+  line-height: 1.8;
+  font-weight: 600;
+  color: #ffe08a;
+  text-shadow: 0 0 10px rgba(255, 200, 70, 0.95), 0 0 22px rgba(255, 170, 40, 0.6), 0 2px 3px #000;
+  opacity: 0;
+  animation:
+    blessIn 1.2s ease 0.5s forwards,
+    blessFloat 3.4s ease-in-out 1.7s infinite alternate;
+}
+@keyframes blessIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 0.95; transform: translateY(0); }
+}
+@keyframes blessFloat {
+  from { transform: translateY(0);    text-shadow: 0 0 8px rgba(255, 200, 70, 0.8), 0 0 18px rgba(255, 170, 40, 0.45), 0 2px 3px #000; }
+  to   { transform: translateY(-6px); text-shadow: 0 0 14px rgba(255, 215, 100, 1), 0 0 30px rgba(255, 180, 50, 0.75), 0 2px 3px #000; }
+}
+.banner .gicon {
+  flex: none;
+  width: 56px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 42px;
+}
+.banner .gicon img { width: 100%; height: 100%; object-fit: contain; }
+.banner .txt {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.banner .who  { color: #ffd978; }
+.banner .gift { color: #ff9db5; }
+.banner .cnt  { color: #ffffff; }
+
+@keyframes bannerIn {
+  from { opacity: 0; transform: translateY(-40px) scale(0.85); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes bannerOut {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to   { opacity: 0; transform: translateY(-20px) scale(0.95); }
+}
+
+/* ================================================================== */
+/*  Devotee  (Pixar-style PNG sprite character)                        */
+/*  The element's origin (0,0) is the point between the feet.          */
+/*  JS sets: transform (translate + scale), --s (scale), --bs (badge)  */
+/*  Classes on .devotee: male | female, p-stand/kneel/pro/sit,         */
+/*                       k-walk/k-bow/k-pray/k-sit (sprite shown),     */
+/*                       front (facing viewer), walking, turning       */
+/*  Light comes from the upper-left, shadows fall to the right/back.   */
+/*                                                                      */
+/*  SIZE: the indoor-hall enlargement (+18%) is CFG.devoteeScale in     */
+/*  index.html (applied to the whole devotee: sprite, shadows, badge    */
+/*  position). The base heights below stay at scale 1.                  */
+/* ================================================================== */
+.devotee {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  opacity: 1;
+  transition: opacity 0.7s ease;
+}
+.devotee.enter  { opacity: 0; }
+.devotee.fading { opacity: 0; transition-duration: 1.8s; }
+
+/* ---------- Ground shadows ---------- */
+/* long soft shadow cast to the right/back by the body (light from front-left) */
+.cast {
+  position: absolute;
+  left: -8px;
+  bottom: 8px;
+  width: 46px;
+  height: 150px;
+  border-radius: 50% 50% 30% 30% / 25% 25% 10% 10%;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.16) 70%, rgba(0, 0, 0, 0));
+  filter: blur(3px);
+  transform-origin: 0 100%;
+  transform: skewX(-58deg) scaleY(0.32);
+  opacity: 0.85;
+  transition: transform 0.6s ease, opacity 0.6s ease;
+}
+.p-kneel .cast { transform: skewX(-58deg) scaleY(0.24); opacity: 0.8; }
+.p-pro .cast   { transform: skewX(-70deg) scaleY(0.2) scaleX(1.5); opacity: 0.75; }
+.p-sit .cast   { transform: skewX(-58deg) scaleY(0.2) scaleX(1.5); opacity: 0.7; }
+
+/* soft contact shadow right under the feet */
+.shadow {
+  position: absolute;
+  left: -52px;
+  top: -12px;
+  width: 104px;
+  height: 24px;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at 50% 50%, rgba(0, 0, 0, 0.66) 0, rgba(0, 0, 0, 0.36) 46%, rgba(0, 0, 0, 0) 74%);
+  transition: transform 0.6s ease, opacity 0.6s ease;
+}
+.p-kneel .shadow { transform: scale(1.15, 1.1); }
+.p-pro .shadow   { transform: translateY(-6px) scale(1.3, 1.5); }
+.p-sit .shadow   { transform: scale(1.5, 1.4); }
+
+/* dark contact spots under the two knees (kneeling / prostrating / seated) */
+.contact {
+  position: absolute;
+  left: -48px;
+  top: -17px;
+  width: 96px;
+  height: 22px;
+  opacity: 0;
+  background:
+    radial-gradient(ellipse 22px 8px at 27% 55%, rgba(0, 0, 0, 0.8), rgba(0, 0, 0, 0)),
+    radial-gradient(ellipse 22px 8px at 73% 55%, rgba(0, 0, 0, 0.8), rgba(0, 0, 0, 0));
+  transition: opacity 0.5s ease, transform 0.6s ease;
+}
+.p-kneel .contact, .p-pro .contact { opacity: 1; }
+.p-sit .contact { opacity: 0.9; transform: scale(1.45, 1.25); }
+
+/* ---------- Sprite character ---------- */
+/* TUNE HERE: sprite heights in px at scale 1 (perspective scaling + CFG.devoteeScale are applied on top). */
+.devotee {
+  --h-walk: 250px;   /* back view, walking / standing */
+  --h-bow:  200px;   /* back view, bowing / prostrating */
+  --h-pray: 240px;   /* front view, walking to the seat */
+  --h-sit:  170px;   /* back view, seated cross-legged */
+  --hcur: var(--h-walk);
+}
+.devotee.k-walk { --hcur: var(--h-walk); }
+.devotee.k-bow  { --hcur: var(--h-bow); }
+.devotee.k-pray { --hcur: var(--h-pray); }
+.devotee.k-sit  { --hcur: var(--h-sit); }
+
+/* .lift = box as tall as the current sprite, standing on the feet point; the badge sits on its top edge */
+.lift {
+  position: absolute;
+  z-index: 2;
+  left: 0;
+  bottom: 0;
+  width: 0;
+  height: var(--hcur);
+}
+/* .fig = walking bob / breathing / turning animations */
+.fig {
+  position: absolute;
+  left: -200px;
+  bottom: 0;
+  width: 400px;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: flex-end;
+  transform-origin: 50% 100%;
+}
+/* .sprite = the PNG; pose transforms (prostration dip) happen here */
+.sprite {
+  display: block;
+  height: 100%;
+  width: auto;
+  max-width: none;
+  pointer-events: none;
+  user-select: none;
+  transform-origin: 50% 100%;
+  transition: transform 0.6s ease-in-out;
+  filter: drop-shadow(2px 3px 3px rgba(0, 0, 0, 0.38));   /* silhouette shadow = depth */
+}
+
+/* ---------- Badge: avatar + username above the head ---------- */
+.badge {
+  position: absolute;
+  z-index: 20;
+  left: 50%;
+  bottom: 100%;
+  width: 0;
+  margin-bottom: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transform-origin: 50% 100%;
+  --by: 0px;
+  --bk: 1;
+  /* cancel perspective scaling so the name stays readable far away */
+  transform: translateY(var(--by)) scale(calc(var(--bs) / var(--s) * var(--bk)));
+  transition: transform 0.6s ease;
+}
+.badge-in {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  animation: float 2.4s ease-in-out infinite;
+}
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-4px); }
+}
+.avatar {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #fff;
+  border: 4px solid #ffd978;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.5);
+}
+.nick {
+  margin-top: 4px;
+  max-width: 130px;
+  padding: 3px 12px;
+  border-radius: 999px;
+  background: rgba(25, 8, 4, 0.82);
+  border: 2px solid #f5c84c;
+  color: #fff4d0;
+  font-size: 21px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 2px #000;
+}
+
+/* ================================================================== */
+/*  Poses (class on .devotee, switched by JS)                          */
+/*  The sprite image itself is swapped by JS (walk / bow / pray / sit). */
+/* ================================================================== */
+/* kneel: body sinks a little */
+.p-kneel .sprite { transform: translateY(6px) scale(1.02, 0.93); }
+.p-kneel .badge  { --by: calc(var(--hcur) * 0.07 + 6px); }
+
+/* prostration: body dips low, forehead + palms touch the floor. */
+.p-pro .sprite { transform: translateY(16px) scale(1.06, 0.78); }
+.p-pro .badge  { --by: calc(var(--hcur) * 0.22 + 16px); }
+
+/* seated: smaller badge so the rows stay readable */
+.p-sit .badge { --bk: 0.65; }
+
+/* calm breathing while seated */
+.p-sit .fig { animation: breathe 3.6s ease-in-out infinite; }
+@keyframes breathe {
+  0%, 100% { transform: scale(1, 1); }
+  50%      { transform: scale(1.012, 1.018); }
+}
+
+/* ================================================================== */
+/*  Walking + turning                                                  */
+/* ================================================================== */
+.walking .fig { animation: walkBob 0.42s ease-in-out infinite alternate; }
+@keyframes walkBob {
+  from { transform: translateY(0)    rotate(-1.6deg) scale(1, 1); }
+  to   { transform: translateY(-7px) rotate(1.6deg)  scale(1.01, 0.985); }
+}
+
+/* turn around: squash sideways while the sprite swaps (back <-> front) */
+.turning .fig { animation: turn 0.45s ease-in-out; }
+@keyframes turn {
+  0%   { transform: scaleX(1); }
+  50%  { transform: scaleX(0.15); }
+  100% { transform: scaleX(1); }
+}
+
+/* ================================================================== */
+/*  Offerings: flowers / candlelight / stardust (spawned by JS)        */
+/* ================================================================== */
+.fx {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1080px;
+  height: 1920px;
+  z-index: 90000;               /* above devotees, below banners */
+  pointer-events: none;
+  overflow: hidden;
+}
+.fx > * { position: absolute; left: 0; top: 0; will-change: transform, opacity; }
+
+/* golden lotus / flower petals */
+.petal {
+  width: 20px;
+  height: 32px;
+  margin: -16px 0 0 -10px;
+  border-radius: 50% 50% 50% 50% / 75% 75% 25% 25%;
+  filter: drop-shadow(0 0 5px rgba(255, 210, 100, 0.85));
+}
+.petal.gold { background: radial-gradient(ellipse at 40% 25%, #fff6cf 0, #ffd56a 45%, #d9941c 100%); }
+.petal.pink { background: radial-gradient(ellipse at 40% 25%, #ffffff 0, #ffc3d4 45%, #f0709a 100%); }
+
+/* candlelight */
+.candles { left: 0; top: 0; width: 100%; height: 100%; }
+.candles .aura {
+  position: absolute;
+  width: 880px;
+  height: 440px;
+  margin: -220px 0 0 -440px;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at 50% 50%,
+    rgba(255, 214, 120, 0.62) 0,
+    rgba(255, 160, 50, 0.32) 38%,
+    rgba(255, 120, 20, 0) 72%);
+  mix-blend-mode: screen;
+  animation: auraPulse 2.4s ease-in-out infinite alternate;
+}
+@keyframes auraPulse {
+  from { transform: scale(0.95); opacity: 0.78; }
+  to   { transform: scale(1.07); opacity: 1; }
+}
+.candle {
+  position: absolute;
+  width: 14px;
+  height: 44px;
+  margin: -44px 0 0 -7px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #fff4d6, #e8cf94 60%, #b99a5a);
+  box-shadow: 0 0 14px rgba(255, 190, 80, 0.55);
+}
+.candle .flame {
+  position: absolute;
+  left: 50%;
+  top: -26px;
+  width: 14px;
+  height: 26px;
+  margin-left: -7px;
+  border-radius: 50% 50% 50% 50% / 62% 62% 38% 38%;
+  background: radial-gradient(ellipse at 50% 72%, #fff9dc 0, #ffd35a 38%, #ff8a1f 75%, rgba(255, 90, 0, 0) 100%);
+  box-shadow: 0 0 16px 6px rgba(255, 170, 50, 0.75), 0 0 34px 14px rgba(255, 120, 20, 0.35);
+  transform-origin: 50% 100%;
+  animation: flicker 0.22s ease-in-out infinite alternate;
+}
+@keyframes flicker {
+  from { transform: scale(1, 0.93) rotate(-3deg); }
+  to   { transform: scale(0.94, 1.07) rotate(3deg); }
+}
+
+/* shimmering golden stardust */
+.star {
+  border-radius: 50%;
+  background: radial-gradient(circle, #ffffff 0, #ffeaa0 38%, rgba(255, 200, 60, 0) 72%);
+  box-shadow: 0 0 10px 3px rgba(255, 210, 90, 0.7);
+}
+
+/* soft golden halo at the Sayadaw's platform when offerings arrive */
+.halo {
+  border-radius: 50%;
+  mix-blend-mode: screen;
+  background: radial-gradient(circle, rgba(255, 220, 130, 0.65) 0, rgba(255, 180, 60, 0.25) 45%, rgba(255, 150, 30, 0) 72%);
+}
+
+/* ================================================================== */
+/*  "Click anywhere to enable sound" indicator                         */
+/*  (only shown if dhamma.mp3 exists and the browser blocks autoplay)  */
+/* ================================================================== */
+.soundhint {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 200000;
+  padding: 8px 20px;
+  border-radius: 999px;
+  background: rgba(25, 8, 4, 0.78);
+  border: 2px solid rgba(245, 200, 76, 0.7);
+  color: #ffe9a8;
+  font-size: 18px;
+  letter-spacing: 0.3px;
+  text-shadow: 0 1px 2px #000;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.6s ease;
+}
+.soundhint.show { opacity: 0.85; animation: hintPulse 2.2s ease-in-out infinite; }
+@keyframes hintPulse {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 0.95; }
+}
