@@ -11,7 +11,6 @@
     <div id="banners"></div>
   </div>
 
-  <script src="/socket.io/socket.io.js"></script>
   <script>
   (() => {
     'use strict';
@@ -52,11 +51,9 @@
       fadeMs: 1800,             // fade-out time of a replaced devotee
       bannerMs: 5000,           // how long a gift banner stays
       maxBanners: 4,            // banners visible at once
-      syncWaitMs: 1500,         // wait this long for the server's saved hall
 
       // Anti-static idle loop: a BOT devotee walks in, bows 3x and sits down.
-      // (the server can override these via BOT_* in server.js, or use
-      //  ?botMin=8&botMax=12 in the URL, values in seconds; ?bots=0 turns bots off)
+      // (use ?botMin=8&botMax=12 in the URL, values in seconds; ?bots=0 turns bots off)
       botEnabled: true,
       botMinMs: 10000,          // shortest wait between two bots
       botMaxMs: 15000,          // longest wait between two bots
@@ -64,7 +61,7 @@
       botMinFreeSpots: 2,       // bots never take the last bowing spots: real users first
       botRetryMs: 3000,         // re-check this often while a real user is busy
 
-      // Background chanting loop (dhamma.mp3). The server can override this via SOUND_CONFIG.
+      // Background chanting loop (dhamma.mp3).  URL: ?volume=0.5  (0.0 - 1.0)
       dhammaVolume: 0.5,
 
       // Offerings (flowers / candlelight / stardust) drift toward the Sayadaw's offering table
@@ -72,6 +69,15 @@
 
       // Show Burmese names for common gifts (edit GIFT_MY below to add more)
       translateGifts: true,
+
+      // ---- TikFinity Desktop (local WebSocket, runs on the streamer's own computer) ----
+      // The overlay (inside OBS) connects straight to it: no Node.js, no server.js.
+      // Override in the URL with  ?ws=ws://127.0.0.1:21213/
+      tikfinityUrls: ['ws://127.0.0.1:21213/', 'ws://localhost:21213/'],   // tried in turn
+      reconnectMs: 3000,        // retry every 3 seconds while TikFinity is closed / restarting
+
+      // Hall memory: the seated devotees come back after you refresh OBS (stored in this browser)
+      hallMax: 30,              // must be >= number of seats (20 seats: 10 left + 10 right)
     };
     CFG.spawnX = Math.round(CFG.W * CFG.entrance.x / 100);
     CFG.spawnY = Math.round(CFG.H * CFG.entrance.y / 100);
@@ -140,6 +146,11 @@
     if (params.has('botMin')) CFG.botMinMs = Math.max(1, Number(params.get('botMin')) || 10) * 1000;
     if (params.has('botMax')) CFG.botMaxMs = Math.max(1, Number(params.get('botMax')) || 15) * 1000;
     if (params.get('bots') === '0') CFG.botEnabled = false;
+    if (params.has('volume')) {
+      const v = Number(params.get('volume'));
+      if (isFinite(v) && v >= 0 && v <= 1) CFG.dhammaVolume = v;
+    }
+    if (params.has('ws') && /^wss?:\/\//i.test(params.get('ws'))) CFG.tikfinityUrls = [params.get('ws')];
 
     /* ============================================================ */
     /*  Stage scaling (fit 1080x1920 into any OBS source size)       */
@@ -227,6 +238,16 @@
 
     const isUrl = (u) => /^https?:\/\//i.test(u || '');
 
+    // Any value (string, array, object, emoji, garbage) -> short safe string
+    function safeStr(v, max, fallback) {
+      try {
+        if (Array.isArray(v)) v = v[0];
+        if (v === undefined || v === null || typeof v === 'object') return fallback;
+        const s = String(v).trim();
+        return s ? Array.from(s).slice(0, max).join('') : fallback;   // Array.from = never cuts an emoji in half
+      } catch (e) { return fallback; }
+    }
+
     // Fallback avatar: coloured circle with the first letter of the name
     function fallbackAvatar(name) {
       const colors = ['#e57373', '#64b5f6', '#81c784', '#ffb74d', '#ba68c8', '#4db6ac'];
@@ -257,6 +278,46 @@
       d.style.left = CFG.altarX + 'px'; d.style.top = CFG.altarY + 'px';
       d.style.background = '#ffd23a';
       el('span', '', d).textContent = 'OFFERINGS';
+    }
+
+    /* ============================================================ */
+    /*  Hall memory (browser localStorage, replaces hall.json)       */
+    /*  The most recent gift senders are remembered so the seated    */
+    /*  devotees come back after you refresh OBS or restart it.      */
+    /*  URL: ?reset=1 clears the remembered hall.                    */
+    /* ============================================================ */
+    const HALL_KEY = 'sayadaw_hall_v1';
+
+    function loadHall() {
+      try {
+        if (params.has('reset')) { localStorage.removeItem(HALL_KEY); return []; }
+        const saved = JSON.parse(localStorage.getItem(HALL_KEY) || '[]');
+        if (!Array.isArray(saved)) return [];
+        return saved
+          .filter((u) => u && typeof u === 'object' && u.userId)
+          .map((u) => ({
+            userId: String(u.userId),
+            nickname: safeStr(u.nickname, 40, 'Guest'),
+            profilePictureUrl: isUrl(u.profilePictureUrl) ? String(u.profilePictureUrl) : '',
+          }))
+          .slice(-CFG.hallMax);
+      } catch (e) { return []; }
+    }
+
+    let hall = loadHall();
+    let hallTimer = null;
+    function saveHall() {
+      if (hallTimer) return;                    // debounced: a burst of gifts writes once
+      hallTimer = setTimeout(() => {
+        hallTimer = null;
+        try { localStorage.setItem(HALL_KEY, JSON.stringify(hall)); } catch (e) { /* storage blocked: ignore */ }
+      }, 500);
+    }
+    function rememberUser(u) {
+      hall = hall.filter((h) => h.userId !== u.userId);   // same viewer moves to "newest"
+      hall.push({ userId: u.userId, nickname: u.nickname, profilePictureUrl: u.profilePictureUrl });
+      if (hall.length > CFG.hallMax) hall = hall.slice(-CFG.hallMax);
+      saveHall();
     }
 
     /* ============================================================ */
@@ -817,7 +878,7 @@
     }
 
     function onGift(data) {
-      if (!populated) populate([]);              // make sure the hall exists
+      if (!populated) populate(hall);            // make sure the hall exists
       showBanner(data);                          // Burmese merit banner + blessing
       spawnOffering(data.giftName, data.count);  // flowers / candlelight / stardust
 
@@ -1111,55 +1172,161 @@
     requestAnimationFrame(tick);
 
     /* ============================================================ */
-    /*  Socket.IO (auto-reconnect)                                   */
-    /*  OBS URL:  https://your-app.onrender.com/?username=TIKTOK_NAME */
-    /*  The server connects to that streamer's TikTok LIVE and sends */
-    /*  the events: sync, gift, bot, reset (same data as before).    */
+    /*  TikFinity Desktop connection (direct, no server.js)          */
+    /*  The overlay inside OBS talks to TikFinity's local WebSocket  */
+    /*  on the SAME computer:  ws://127.0.0.1:21213/                 */
+    /*  TikFinity sends JSON like { "event": "gift", "data": {...} } */
     /* ============================================================ */
-    function handleServerMessage(msg) {
-      try {
-        if (msg.type === 'sync') {                            // saved hall from the server
-          if (msg.config && !params.has('botMin') && !params.has('botMax')) {
-            const c = msg.config;
-            if (typeof c.botEnabled === 'boolean' && params.get('bots') !== '0') CFG.botEnabled = c.botEnabled;
-            if (c.botMinMs > 0) CFG.botMinMs = c.botMinMs;
-            if (c.botMaxMs >= CFG.botMinMs) CFG.botMaxMs = c.botMaxMs;
-          }
-          if (msg.config && typeof msg.config.dhammaVolume === 'number' && msg.config.dhammaVolume >= 0) {
-            CFG.dhammaVolume = msg.config.dhammaVolume;
-            Dhamma.applyVolume();
-          }
-          populate(msg.users);
-        }
-        else if (msg.type === 'bot') spawnBot();              // /bot test link
-        else if (msg.type === 'gift') onGift(msg);            // ONLY gifts spawn real users
-        else if (msg.type === 'reset') location.reload();
-      } catch (e) { /* ignore bad messages */ }
+
+    // Works with flat fields (TikFinity) and nested "user" (v2-style) shapes
+    function getUser(d) {
+      const u = d.user || {};
+      const nickname = d.nickname || u.nickname || d.uniqueId || u.uniqueId || 'Guest';
+      const userId = String(d.userId || u.userId || d.uniqueId || u.uniqueId || nickname);
+      const profilePictureUrl =
+        d.profilePictureUrl ||
+        (typeof u.profilePicture === 'string' ? u.profilePicture : '') ||
+        (u.profilePicture && ((u.profilePicture.url && u.profilePicture.url[0]) ||
+          (u.profilePicture.urls && u.profilePicture.urls[0]))) ||
+        '';
+      return { userId, nickname, profilePictureUrl };
     }
 
-    function connect() {
-      if (typeof io !== 'function') {                         // socket.io client script not loaded: retry the page load
-        console.error('[socket] socket.io client missing - retrying in 5s');
-        setTimeout(() => location.reload(), 5000);
+    function getGift(d) {
+      const det = d.giftDetails || {};
+      const giftName = d.giftName || det.giftName || (d.gift && d.gift.name) || 'Gift';
+      const giftType = d.giftType !== undefined ? d.giftType : det.giftType;
+      const count = Math.max(1, Number(d.repeatCount) || 1);
+      const giftPictureUrl =
+        d.giftPictureUrl ||
+        (det.giftImage && (det.giftImage.giftPictureUrl || (det.giftImage.url && det.giftImage.url[0]))) ||
+        '';
+      return { giftName, giftType, count, giftPictureUrl };
+    }
+
+    let lastGiftKey = '', lastGiftAt = 0, giftCounter = 0;
+
+    // ANY gift sends a devotee: walk up -> bow 3x -> walk to a seat -> listen to the sermon
+    function handleGiftEvent(data, persist) {
+      const gift = getGift(data);
+
+      // Streakable gifts (e.g. Rose) can fire many events while tapping.
+      // If TikFinity marks the streak as still running, wait for the final one.
+      if (gift.giftType === 1 && data.repeatEnd === false) return;
+
+      const user = getUser(data);
+
+      // Safety net against the same gift being delivered twice in a row
+      const key = `${user.userId}|${gift.giftName}|${gift.count}|${data.msgId || data.giftId || ''}`;
+      const now = Date.now();
+      if (data.msgId && key === lastGiftKey && now - lastGiftAt < 1000) return;
+      lastGiftKey = key;
+      lastGiftAt = now;
+
+      giftCounter += 1;
+      if (persist) rememberUser(user);
+      console.log(`[GIFT] ${user.nickname} sent ${gift.giftName} x${gift.count}`);
+      onGift({
+        type: 'gift',
+        id: `gift-${now}-${giftCounter}`,
+        userId: user.userId,
+        nickname: user.nickname,
+        profilePictureUrl: user.profilePictureUrl,
+        giftName: gift.giftName,
+        count: gift.count,
+        giftPictureUrl: gift.giftPictureUrl,
+      });
+    }
+
+    // Be tolerant about the envelope: { event, data } or { type, data } or a bare event
+    function handleTikFinityMessage(raw) {
+      let msg;
+      try { msg = JSON.parse(raw); } catch (e) { return; }          // ignore non-JSON frames
+      if (!msg || typeof msg !== 'object') return;
+
+      const eventName = String(msg.event || msg.type || msg.eventName || '').toLowerCase();
+      const data = msg.data || msg.payload || msg;
+
+      if (eventName === 'gift') {
+        handleGiftEvent(data, true);
+      } else if (eventName === 'follow' || eventName === 'share' || eventName === 'chat' ||
+                 eventName === 'member' || eventName === 'join') {
+        // Safely accepted. They do not spawn devotees (only gifts do), so nothing breaks.
+        if (params.has('debug')) console.log('[TikFinity]', eventName, getUser(data).nickname);
+      }
+    }
+
+    let tfWs = null, tfTimer = null, tfAttempt = 0, tfOpened = false;
+
+    function scheduleReconnect() {
+      if (tfTimer) return;
+      tfTimer = setTimeout(() => { tfTimer = null; connectTikFinity(); }, CFG.reconnectMs);
+    }
+
+    function connectTikFinity() {
+      const urls = CFG.tikfinityUrls;
+      const url = urls[tfAttempt % urls.length];
+      tfAttempt += 1;
+      tfOpened = false;
+      let ws;
+      try {
+        ws = new WebSocket(url);
+      } catch (e) {
+        console.warn('[TikFinity] cannot open', url, e && e.message);
+        scheduleReconnect();
         return;
       }
-      const username = (params.get('username') || '').trim();
-      const socket = io({
-        query: { username },
-        transports: ['websocket', 'polling'],
-        reconnection: true,
-        reconnectionDelay: 1000,
-        reconnectionDelayMax: 5000,
-      });
-      ['sync', 'bot', 'gift', 'reset'].forEach((t) =>
-        socket.on(t, (m) => handleServerMessage(Object.assign({}, m || {}, { type: t }))));
-      socket.on('status', (s) => console.log('[status]', s && s.state));
-      socket.on('connect_error', (e) => console.warn('[socket] connect_error:', e && e.message));
-    }
-    connect();
+      tfWs = ws;
 
-    // If the server never answers, still show a hall full of bots
-    setTimeout(() => populate([]), CFG.syncWaitMs);
+      ws.onopen = () => {
+        tfOpened = true;
+        console.log('[TikFinity] connected to', url, '- waiting for gifts');
+      };
+      ws.onmessage = (ev) => {
+        try { handleTikFinityMessage(ev.data); } catch (e) {
+          console.error('[TikFinity] message ignored:', e && e.message);
+        }
+      };
+      ws.onclose = () => {
+        if (tfWs !== ws) return;
+        if (tfOpened) console.log('[TikFinity] disconnected - retrying');
+        scheduleReconnect();                       // retry every few seconds, forever
+      };
+      ws.onerror = () => {
+        // 'close' fires right after 'error' and schedules the reconnect
+        try { ws.close(); } catch (e) { /* ignore */ }
+      };
+    }
+
+    // Safety: if the socket looks open but TikFinity froze, nothing arrives; a half-dead
+    // connection is replaced when the browser reports it closed. Also re-check when the page wakes up.
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && (!tfWs || tfWs.readyState === WebSocket.CLOSED)) {
+        if (tfTimer) { clearTimeout(tfTimer); tfTimer = null; }
+        connectTikFinity();
+      }
+    });
+
+    // Test without TikTok:   /?demo=1   sends a fake gift every few seconds (not saved to the hall)
+    if (params.has('demo')) {
+      const names = ['Hung', 'Mya', 'Aung', 'Thida', 'Kyaw', 'Su', 'Min', 'Hla'];
+      const gifts = ['Rose', 'Candle', 'Galaxy', 'Lotus', 'Heart'];
+      let n = 0;
+      setInterval(() => {
+        n += 1;
+        const nick = pick(names) + ' ' + n;
+        handleGiftEvent({
+          userId: 'demo-' + nick, nickname: nick, profilePictureUrl: '',
+          giftName: pick(gifts), repeatCount: 1 + Math.floor(Math.random() * 3), giftType: 2,
+        }, false);
+      }, 4000);
+    }
+
+    /* ============================================================ */
+    /*  Start: remembered hall (or bots) first, then TikFinity       */
+    /* ============================================================ */
+    populate(hall);
+    connectTikFinity();
   })();
   </script>
 </body>
